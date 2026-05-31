@@ -61,7 +61,13 @@ class SnakeBeta(nn.Module):
             x = tl.load(x_ptr + bid * stride_b + cid * stride_c + t_off, mask=mask, other=0.0)
             ea = tl.load(exp_alpha_ptr + cid)
             ib = tl.load(inv_beta_ptr + cid)
-            sin_val = tl.sin(x * ea)
+            sin_input = x * ea
+            # tl.sin requires fp32/fp64; promote only low-precision floating inputs.
+            if tl.constexpr(sin_input.dtype.is_floating()) and tl.constexpr(
+                sin_input.dtype.primitive_bitwidth
+            ) < tl.constexpr(32):
+                sin_input = sin_input.to(tl.float32)
+            sin_val = tl.sin(sin_input)
             result = x + ib * sin_val * sin_val
 
             tl.store(out_ptr + bid * stride_b + cid * stride_c + t_off, result, mask=mask)
