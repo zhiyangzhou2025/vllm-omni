@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Stage 0 append planning for Qwen3-Omni-Duplex."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
+
+INPUT_SAMPLES_PER_UNIT = 7680
+AUDIO_TOKENS_PER_UNIT = 6
+AUDIO_BOUNDARY_TOKENS = 2
+UNIT_START_TOKENS = 1
+AUDIO_WINDOW_PROMPT_TOKENS = UNIT_START_TOKENS + AUDIO_BOUNDARY_TOKENS + AUDIO_TOKENS_PER_UNIT
+
+
+def build_audio_window_prompt(
+    *,
+    request_id: str,
+    fence: DuplexFence,
+    session_config: Mapping[str, object],
+    runtime_config: Mapping[str, object],
+    seq: int,
+    turn_seq: int,
+    payload: object,
+    final: bool,
+) -> dict[str, object]:
+    """Reserve one exact 0.48-second audio window in the Stage 0 scheduler.
+
+    The worker replaces these IDs with ``<|unit_start|>``, audio-boundary
+    embeddings, and the six audio-tower embeddings. The count must stay exact
+    because surplus scheduler slots become KV entries.
+    """
+
+    if not isinstance(payload, Mapping) or payload.get("audio") is None:
+        raise ValueError("Qwen3-Omni-Duplex Stage 0 requires one audio payload")
+    token_id = DUPLEX_TOKENS.unit_start
+    return build_duplex_append_prompt(
+        request_id=request_id,
+        fence=fence,
+        session_config=session_config,
+        runtime_config=runtime_config,
+        seq=seq,
+        turn_seq=turn_seq,
+        payload=payload,
+        final=final,
+        prompt_token_ids=[token_id] * AUDIO_WINDOW_PROMPT_TOKENS,
+        model_fields={
+            "model_type": "qwen3_omni_duplex",
+            "scheduler_token_id": token_id,
+            "audio_tokens_per_unit": AUDIO_TOKENS_PER_UNIT,
+            "input_samples_per_unit": INPUT_SAMPLES_PER_UNIT,
+        },
+    )
