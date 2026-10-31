@@ -228,4 +228,8 @@ class ThinkerWindowState:
 
     @staticmethod
     def _mask(logits: Mapping[int, float], *, allowed: set[int]) -> dict[int, float]:
-        return {token_id: value for token_id, value in logits.items() if token_id not in DUPLEX_TOKEN_IDS or token_id in allowed}
+        return {
+            token_id: value
+            for token_id, value in logits.items()
+            if token_id not in DUPLEX_TOKEN_IDS or token_id in allowed
+        }
