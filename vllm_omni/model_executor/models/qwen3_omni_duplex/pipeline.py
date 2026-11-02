@@ -45,6 +45,7 @@ def _stage(
 QWEN3_OMNI_DUPLEX_THINKER_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_duplex_thinker",
     model_arch=_ARCH,
+    duplex_plugin="vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin.Qwen3OmniDuplexPlugin",
     stages=(
         _stage(
             stage_id=0,
