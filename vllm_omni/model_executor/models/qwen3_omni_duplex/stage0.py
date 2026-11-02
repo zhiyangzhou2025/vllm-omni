@@ -27,17 +27,21 @@ def build_audio_window_prompt(
     turn_seq: int,
     payload: object,
     final: bool,
+    prefix_token_ids: tuple[int, ...] = (),
 ) -> dict[str, object]:
     """Reserve one exact 0.48-second audio window in the Stage 0 scheduler.
 
-    The worker replaces these IDs with ``<|unit_start|>``, audio-boundary
-    embeddings, and the six audio-tower embeddings. The count must stay exact
-    because surplus scheduler slots become KV entries.
+    The worker replaces the trailing placeholder IDs with ``<|unit_start|>``,
+    audio-boundary embeddings, and the six audio-tower embeddings. Tokens
+    before them are replayed verbatim: the system prefix on the first append,
+    and the previous window's forced boundary tokens after that. The window
+    count must stay exact because surplus scheduler slots become KV entries.
     """
 
     if not isinstance(payload, Mapping) or payload.get("audio") is None:
         raise ValueError("Qwen3-Omni-Duplex Stage 0 requires one audio payload")
     token_id = DUPLEX_TOKENS.unit_start
+    prompt_token_ids = [*prefix_token_ids, *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS)]
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,
@@ -47,7 +51,7 @@ def build_audio_window_prompt(
         turn_seq=turn_seq,
         payload=payload,
         final=final,
-        prompt_token_ids=[token_id] * AUDIO_WINDOW_PROMPT_TOKENS,
+        prompt_token_ids=prompt_token_ids,
         model_fields={
             "model_type": "qwen3_omni_duplex",
             "scheduler_token_id": token_id,

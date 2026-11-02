@@ -14,6 +14,9 @@ from vllm_omni.config.stage_config import (
 )
 
 _ARCH = "Qwen3OmniMoeForConditionalGeneration"
+# Stage 0 needs the duplex subclass: it replaces audio-window placeholders and
+# constrains sampling to the window protocol. Stages 1 and 2 have no such work.
+_STAGE0_ARCH = "Qwen3OmniDuplexForConditionalGeneration"
 
 
 def _stage(
@@ -44,7 +47,7 @@ def _stage(
 
 QWEN3_OMNI_DUPLEX_THINKER_PIPELINE = PipelineConfig(
     model_type="qwen3_omni_duplex_thinker",
-    model_arch=_ARCH,
+    model_arch=_STAGE0_ARCH,
     duplex_plugin="vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin.Qwen3OmniDuplexPlugin",
     stages=(
         _stage(

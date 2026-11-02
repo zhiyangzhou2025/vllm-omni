@@ -20,10 +20,15 @@ from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payl
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import (
     Qwen3OmniDuplexDataPlane,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
+    MAX_GENERATED_TOKENS_PER_WINDOW,
+    forced_token_ids,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.session import (
     Qwen3OmniDuplexSessionState,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
+    AUDIO_WINDOW_PROMPT_TOKENS,
     INPUT_SAMPLES_PER_UNIT,
     build_audio_window_prompt,
 )
@@ -33,6 +38,18 @@ PLUGIN_ID = "qwen3_omni_duplex"
 INPUT_SAMPLE_RATE_HZ = 16000
 # One 0.48-second window. The runner's silence continuation uses the same unit.
 UNIT_DURATION_MS = 480
+# The session's system prompt, wrapped in the chat template. A client that sets
+# no instructions gets the reference runtime's prompt.
+DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
+SYSTEM_PREFIX_TEMPLATE = "<|im_start|>system\n{instructions}<|im_end|>\n"
+# Tokens a window can sample as its last token. ``unit_end`` is never sampled:
+# the protocol appends it after the sampled token, so stopping on it would let
+# the window run to the token budget.
+WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos, DUPLEX_TOKENS.turn_eos)
+# The worker reports a closed window's replay tokens through the client
+# multimodal channel. The engine cannot derive them: the output it receives
+# carries only the last step's token.
+FORCED_TOKEN_KEY = "duplex_forced_token_ids"
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
@@ -43,6 +60,14 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     silence_continuation_sample_rate_hz = INPUT_SAMPLE_RATE_HZ
     data_plane = Qwen3OmniDuplexDataPlane()
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        # Prefixes are staged until the stage accepts the append, so a rejected
+        # append does not consume the previous window's boundary tokens.
+        self._pending_prefix: dict[str, tuple[int, ...]] = {}
+        self._submitted_prefix: dict[str, tuple[int, ...]] = {}
+        self._forced_token_ids: dict[str, tuple[int, ...]] = {}
+
     def configure_sampling_params(
         self,
         *,
@@ -50,11 +75,18 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         defaults: tuple[object, ...],
     ) -> tuple[object, ...]:
         del runtime_config
-        # The window prefill samples nothing. One decode step decides listen or
-        # speak; the runner resubmits the same request for the next step.
-        return tuple(
-            default.clone() if isinstance(default, SamplingParams) else default for default in defaults
-        )
+        # One append is one window. Decoding runs until the window closes, which
+        # the protocol tokens signal, or until the window budget runs out.
+        configured = []
+        for default in defaults:
+            if not isinstance(default, SamplingParams):
+                configured.append(default)
+                continue
+            params = default.clone()
+            params.max_tokens = MAX_GENERATED_TOKENS_PER_WINDOW
+            params.stop_token_ids = list(WINDOW_STOP_TOKEN_IDS)
+            configured.append(params)
+        return tuple(configured)
 
     def plan_append(
         self,
@@ -76,18 +108,20 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             exact_samples=INPUT_SAMPLES_PER_UNIT,
             model="Qwen3-Omni-Duplex",
         )
-        return DuplexAppendPlan(
-            prompt=build_audio_window_prompt(
-                request_id=request_id,
-                fence=fence,
-                session_config=session_config,
-                runtime_config=runtime_config,
-                seq=seq,
-                turn_seq=turn_seq,
-                payload=payload,
-                final=final,
-            )
+        prefix = self._prefix_token_ids(request_id, runtime_config)
+        prompt = build_audio_window_prompt(
+            request_id=request_id,
+            fence=fence,
+            session_config=session_config,
+            runtime_config=runtime_config,
+            seq=seq,
+            turn_seq=turn_seq,
+            payload=payload,
+            final=final,
+            prefix_token_ids=prefix,
         )
+        self._pending_prefix[request_id] = prefix
+        return DuplexAppendPlan(prompt=prompt)
 
     def decide_output(
         self,
@@ -119,6 +153,35 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 "model_listen": native_decision == "listen",
             },
         )
+
+    def commit_append_plan(self, request_id: str) -> None:
+        prefix = self._pending_prefix.pop(request_id, None)
+        if prefix is not None:
+            self._submitted_prefix[request_id] = prefix
+
+    def runtime_config_after_model_output(
+        self,
+        current: Mapping[str, object],
+        output_metadata: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Record the boundary tokens the next append must replay.
+
+        Stage 0 is the only stage, so the runner never calls ``decide_output``
+        for it. This hook runs on the session mailbox for the final stage, and
+        the runner submits the next append only after it returns.
+        """
+
+        del current
+        request_id = output_metadata.get("request_id")
+        raw = output_metadata.get(FORCED_TOKEN_KEY)
+        if not isinstance(request_id, str):
+            return None
+        token_ids = _token_ids(raw)
+        if token_ids is None:
+            return None
+        # -1 pads a row and marks a window that did not close this step.
+        self._forced_token_ids[request_id] = tuple(token_id for token_id in token_ids if token_id >= 0)
+        return None
 
     def create_session_state(self) -> Qwen3OmniDuplexSessionState:
         return Qwen3OmniDuplexSessionState()
@@ -160,16 +223,87 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     async def prepare_runtime_config(
         self, config: DuplexSessionConfig, *, model_config: object | None
     ) -> dict[str, object]:
-        del model_config
         self.validate_client_extra_body(config.extra_body)
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 does not take reference audio")
-        return {"model_type": PLUGIN_ID, "asr_enabled": False}
+        instructions = config.instructions if isinstance(config.instructions, str) else ""
+        prefix = self._encode_system_prefix(model_config, instructions or DEFAULT_INSTRUCTIONS)
+        if prefix is None:
+            raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 cannot encode the system prompt")
+        return {
+            "model_type": PLUGIN_ID,
+            "asr_enabled": False,
+            "instructions": instructions or DEFAULT_INSTRUCTIONS,
+            "system_prefix_token_ids": list(prefix),
+        }
 
     def runtime_config_for_update(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
     ) -> dict[str, object]:
-        del config
+        # The prefix is already in the KV cache, so a later session update
+        # cannot change it.
+        if config.instructions != current.get("instructions"):
+            raise DuplexRuntimeConfigError(
+                "instructions cannot be changed after the session is created",
+                code="instructions_update_unsupported",
+            )
         return dict(current)
+
+    def _encode_system_prefix(self, model_config: object | None, instructions: str) -> tuple[int, ...] | None:
+        model_path = getattr(model_config, "model", None)
+        if not isinstance(model_path, str) or not model_path:
+            return None
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+            token_ids = tokenizer.encode(
+                SYSTEM_PREFIX_TEMPLATE.format(instructions=instructions), add_special_tokens=False
+            )
+        except (OSError, ValueError):
+            return None
+        if not token_ids:
+            return None
+        return tuple(int(token_id) for token_id in token_ids)
+
+    def _prefix_token_ids(self, request_id: str, runtime_config: Mapping[str, object]) -> tuple[int, ...]:
+        """Tokens that must enter the KV cache before this window's audio.
+
+        The first append carries the system prefix. Every later append carries
+        the boundary tokens the previous window closed with, because the
+        scheduler discards a finished chunk's sampled tokens.
+        """
+
+        if request_id not in self._submitted_prefix:
+            return self._system_prefix_token_ids(runtime_config)
+        return self._forced_token_ids.pop(request_id, ())
+
+    def _system_prefix_token_ids(self, runtime_config: Mapping[str, object]) -> tuple[int, ...]:
+        raw = runtime_config.get("system_prefix_token_ids")
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 has no encoded system prompt")
+        try:
+            return tuple(int(token_id) for token_id in raw)
+        except (TypeError, ValueError) as exc:
+            raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 system prompt is not encoded") from exc
+
+    def _pending_forced_token_ids(self) -> tuple[int, ...]:
+        return self._forced_token_ids
+
+
+def _token_ids(value: object) -> tuple[int, ...] | None:
+    """Read one request's replay row, whether it arrived as a list or a tensor."""
+
+    if hasattr(value, "detach"):
+        try:
+            value = value.detach().cpu().reshape(-1).tolist()
+        except (RuntimeError, ValueError):
+            return None
+    if not isinstance(value, (list, tuple)):
+        return None
+    try:
+        return tuple(int(token_id) for token_id in value)
+    except (TypeError, ValueError):
+        return None

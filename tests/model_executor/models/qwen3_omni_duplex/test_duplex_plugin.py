@@ -12,6 +12,7 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin, validate_duplex_plugin_sampling
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin import (
     INPUT_SAMPLE_RATE_HZ,
+    WINDOW_STOP_TOKEN_IDS,
     Qwen3OmniDuplexPlugin,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
@@ -26,6 +27,9 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKE
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _PLUGIN_PATH = "vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin.Qwen3OmniDuplexPlugin"
+# ``<|im_start|>system\nStreaming Omni Conversation.<|im_end|>\n``, encoded by the
+# checkpoint tokenizer. Tests pass it in; encoding itself needs the checkpoint.
+_DEFAULT_PREFIX = (151644, 8948, 198, 76509, 85225, 50830, 13, 151645, 198)
 
 
 def _pcm(samples: int) -> dict[str, object]:
@@ -37,12 +41,12 @@ def _pcm(samples: int) -> dict[str, object]:
     }
 
 
-def _plan(plugin: Qwen3OmniDuplexPlugin, payload: object):
+def _plan(plugin: Qwen3OmniDuplexPlugin, payload: object, prefix: tuple[int, ...] = _DEFAULT_PREFIX):
     return plugin.plan_append(
         request_id="req",
         fence=DuplexFence(session_id="sess"),
         session_config={},
-        runtime_config={},
+        runtime_config={"system_prefix_token_ids": list(prefix)},
         seq=1,
         turn_seq=1,
         payload=payload,
@@ -59,14 +63,23 @@ def test_pipeline_declares_the_plugin() -> None:
 
 
 def test_plan_append_reserves_one_exact_window() -> None:
-    plan = _plan(Qwen3OmniDuplexPlugin(lambda *_args: None), _pcm(INPUT_SAMPLES_PER_UNIT))
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+
+    plan = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT))
 
     prompt = plan.prompt
-    assert prompt["prompt_token_ids"] == [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS
+    assert prompt["prompt_token_ids"] == [
+        *_DEFAULT_PREFIX,
+        *([DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS),
+    ]
     duplex = prompt["model_intermediate_buffer"]["duplex"]
     assert duplex["data_plane"] is True
     assert duplex["model_type"] == "qwen3_omni_duplex"
-    assert duplex["scheduler_token_budget"] == AUDIO_WINDOW_PROMPT_TOKENS
+    assert duplex["scheduler_token_budget"] == len(prompt["prompt_token_ids"])
+    # The prefix is staged, not spent, until the stage accepts the append.
+    assert plugin._submitted_prefix == {}
+    plugin.commit_append_plan("req")
+    assert plugin._submitted_prefix["req"] == _DEFAULT_PREFIX
 
 
 @pytest.mark.parametrize("samples", [0, INPUT_SAMPLES_PER_UNIT - 1, INPUT_SAMPLES_PER_UNIT + 1])
@@ -126,15 +139,59 @@ def test_silence_unit_is_one_window() -> None:
 
     assert payload["sample_rate_hz"] == INPUT_SAMPLE_RATE_HZ
     plan = _plan(plugin, payload)
-    assert len(plan.prompt["prompt_token_ids"]) == AUDIO_WINDOW_PROMPT_TOKENS
+    assert plan.prompt["prompt_token_ids"][-AUDIO_WINDOW_PROMPT_TOKENS:] == [DUPLEX_TOKENS.unit_start] * (
+        AUDIO_WINDOW_PROMPT_TOKENS
+    )
 
 
 @pytest.mark.asyncio
-async def test_runtime_config_rejects_reference_audio() -> None:
+async def test_runtime_config_encodes_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    monkeypatch.setattr(plugin, "_encode_system_prefix", lambda model_config, instructions: (7, 8, 9))
 
-    config = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None)
-    assert config == {"model_type": "qwen3_omni_duplex", "asr_enabled": False}
+    config = await plugin.prepare_runtime_config(
+        DuplexSessionConfig(instructions="Answer briefly."), model_config=object()
+    )
+
+    assert config["instructions"] == "Answer briefly."
+    assert config["system_prefix_token_ids"] == [7, 8, 9]
+    plan = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT), prefix=tuple(config["system_prefix_token_ids"]))
+    assert plan.prompt["prompt_token_ids"][:3] == [7, 8, 9]
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_rejects_reference_audio_and_a_changed_prompt() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
 
     with pytest.raises(Exception, match="reference audio"):
         await plugin.prepare_runtime_config(DuplexSessionConfig(ref_audio="clip.wav"), model_config=None)
+    with pytest.raises(Exception, match="instructions cannot be changed"):
+        plugin.runtime_config_for_update(
+            DuplexSessionConfig(instructions="new"), {"instructions": "Streaming Omni Conversation."}
+        )
+
+
+def test_later_appends_replay_the_closed_windows_boundary_tokens() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    first = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT))
+    plugin.commit_append_plan("req")
+
+    plugin.runtime_config_after_model_output({}, {"request_id": "req", "duplex_forced_token_ids": [DUPLEX_TOKENS.unit_end]})
+    second = _plan(plugin, plugin.silence_unit_payload())
+
+    assert first.prompt["prompt_token_ids"][: len(_DEFAULT_PREFIX)] == list(_DEFAULT_PREFIX)
+    assert second.prompt["prompt_token_ids"] == [
+        DUPLEX_TOKENS.unit_end,
+        *([DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS),
+    ]
+
+
+def test_sampling_stops_on_the_sampled_closing_token() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+
+    (params,) = plugin.configure_sampling_params(runtime_config={}, defaults=(SamplingParams(temperature=0.0),))
+
+    assert params.max_tokens == 16
+    assert params.stop_token_ids == list(WINDOW_STOP_TOKEN_IDS)
+    assert DUPLEX_TOKENS.unit_end not in params.stop_token_ids
+    assert params.temperature == 0.0

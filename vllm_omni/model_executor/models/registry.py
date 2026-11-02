@@ -58,6 +58,13 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    # The duplex checkpoint reports the MoE architecture. Only the Stage 0
+    # deployment selects this class; turn-based Qwen3-Omni keeps its own.
+    "Qwen3OmniDuplexForConditionalGeneration": (
+        "qwen3_omni_duplex",
+        "qwen3_omni_duplex",
+        "Qwen3OmniDuplexForConditionalGeneration",
+    ),
     # Step-Audio2 models
     "StepAudio2ForCausalLM": (
         "step_audio2",

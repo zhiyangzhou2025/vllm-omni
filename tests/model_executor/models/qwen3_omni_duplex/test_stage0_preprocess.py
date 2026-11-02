@@ -80,3 +80,23 @@ def test_stage0_decode_keeps_sampled_token_embedding() -> None:
     assert embeddings.tolist() == [[-1.0]]
     assert updates == {}
     assert stage.calls == 0
+
+
+def test_prefill_keeps_prefix_tokens_and_replaces_only_the_window() -> None:
+    stage = _Stage0()
+    payload = {"audio": np.zeros(7680, dtype=np.float32).tobytes(), "sample_rate_hz": 16000}
+    prefix = [11, 22, 33]
+    info = {
+        "duplex": {"data_plane": True, "model_type": "qwen3_omni_duplex", "payload": payload},
+        "_omni_prompt_len": 12,
+        "_omni_num_computed_tokens": 0,
+    }
+
+    token_ids, embeddings, updates = stage.thinker_preprocess(torch.tensor([*prefix, *([1] * 9)]), None, **info)
+
+    assert token_ids[:3].tolist() == prefix
+    assert embeddings[:3].reshape(-1).tolist() == [-1.0, -1.0, -1.0]
+    assert token_ids[3].item() == DUPLEX_TOKENS.unit_start
+    assert token_ids[-1].item() == 151670
+    assert embeddings[5:11].reshape(-1).tolist() == list(range(6))
+    assert updates == {}

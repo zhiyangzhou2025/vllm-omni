@@ -745,9 +745,13 @@ class ModelChannel:
             # projector. Its metrics and transcript still use this mailbox.
             return None
         engine_output = self._build_stage_output(item)
+        # The hook only receives the segment metadata, which carries model output
+        # but not which request produced it. The request id is known here.
+        output_metadata = dict(item.context.segment_output_metadata)
+        output_metadata.setdefault("request_id", item.request_id)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
-            item.context.segment_output_metadata,
+            output_metadata,
         )
         if runtime_config is not None:
             session.replace_runtime_config(runtime_config)
