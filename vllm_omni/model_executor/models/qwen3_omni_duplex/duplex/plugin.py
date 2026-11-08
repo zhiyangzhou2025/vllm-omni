@@ -22,13 +22,12 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import 
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     MAX_GENERATED_TOKENS_PER_WINDOW,
-    forced_token_ids,
+    window_decision,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.session import (
     Qwen3OmniDuplexSessionState,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
-    AUDIO_WINDOW_PROMPT_TOKENS,
     INPUT_SAMPLES_PER_UNIT,
     build_audio_window_prompt,
 )
@@ -42,11 +41,10 @@ UNIT_DURATION_MS = 480
 # no instructions gets the reference runtime's prompt.
 DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
 SYSTEM_PREFIX_TEMPLATE = "<|im_start|>system\n{instructions}<|im_end|>\n"
-# Tokens a window can sample as its last token. Only two tokens stop a window:
-# ``<|listen|>`` and ``<|chunk_eos|>``. ``<|turn_eos|>`` does not stop it: the
-# protocol samples it first and then constrains the next step to
-# ``<|chunk_eos|>``, which is the stop token. ``unit_end`` is never sampled.
-WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos)
+# ``<|unit_end|>`` ends every window, for listen and speak alike. Neither
+# ``<|listen|>`` nor ``<|turn_eos|>`` stops the request: the protocol samples
+# one of them and then constrains the next step to ``<|unit_end|>``.
+WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.unit_end,)
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
@@ -133,15 +131,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         output: object,
     ) -> DuplexOutputDecision | None:
         del stage_id, final_stage_id, segment_output_metadata, output
-        if not segment_finished or not segment_token_ids:
+        if not segment_finished:
             return None
-        decision = segment_token_ids[-1]
-        if decision == DUPLEX_TOKENS.listen:
-            native_decision = "listen"
-        elif decision == DUPLEX_TOKENS.speak:
-            native_decision = "speak"
-        else:
+        decision = window_decision(segment_token_ids)
+        if decision is None:
             return None
+        native_decision = "listen" if decision == "listen" else "speak"
         # No downstream stage exists yet, so both decisions close the segment
         # here. The sampled token is what the client sees.
         return DuplexOutputDecision(
@@ -207,7 +202,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 cannot encode the system prompt")
         return {
             "model_type": PLUGIN_ID,
-            "asr_enabled": False,
             "instructions": instructions or DEFAULT_INSTRUCTIONS,
             "system_prefix_token_ids": list(prefix),
         }

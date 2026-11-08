@@ -12,6 +12,7 @@ import torch
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.artifact import read_user_signal
 from vllm_omni.model_executor.models.qwen3_omni_duplex.audio_window import (
     AUDIO_WINDOW_PROMPT_TOKENS,
     audio_window_from_duplex,
@@ -20,7 +21,7 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     Stage0Windows,
     ThinkerProtocolError,
 )
-from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS, DUPLEX_TOKENS
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS
 
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
@@ -31,15 +32,14 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self._stage0_windows = Stage0Windows()
-        # The stop token the scheduler drops. The next window replays it ahead of
-        # <|unit_end|>, and only this worker sees the sampled token.
-        self._stage0_stop_token: dict[str, int] = {}
         # The parent exposes talker_mtp for every stage, and the runner enables
         # its MTP path whenever the attribute is a method. Stage 0 is the
         # thinker: it has no talker, and that path would demand mtp_inputs the
         # thinker preprocess never produces.
         if self.model_stage == "thinker":
+            # Reading the manifest here rejects a pre-v3 checkpoint at startup
+            # rather than once per session.
+            self._stage0_windows = Stage0Windows(read_user_signal(self.vllm_config.model_config.model))
             self.talker_mtp = None
             self.has_preprocess = True
             self.set_custom_preprocess(self.thinker_preprocess)
@@ -77,8 +77,8 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             encode_audio=self._encode_audio_features,
             device=input_ids.device,
         )
-        # Tokens before the window are the system prefix or forced boundary
-        # tokens replayed from the previous window. They keep their embeddings.
+        # Tokens before the window are the system prefix or the previous
+        # window's <|unit_end|>. They keep their own embeddings.
         if input_embeds is not None and int(input_embeds.shape[0]) == span_length:
             embeds = input_embeds.clone()
         else:
@@ -86,16 +86,6 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         ids = input_ids.clone()
         ids[window_start:] = window.input_ids
         embeds[window_start:] = window.embeddings.to(dtype=embeds.dtype)
-        # The slot ahead of <|unit_end|> was reserved for the stop token the
-        # scheduler dropped. Fill it from the token this worker sampled. The
-        # runner passes the request id at the top of ``info``, not inside the
-        # duplex payload.
-        request_id = info.get("request_id")
-        stop_token = self._stage0_stop_token.pop(request_id, None) if isinstance(request_id, str) else None
-        if stop_token is not None and window_start >= 2:
-            stop_ids = torch.tensor([stop_token], dtype=torch.long, device=ids.device)
-            ids[window_start - 2] = stop_token
-            embeds[window_start - 2] = self._embed_boundary_tokens(stop_ids).to(dtype=embeds.dtype)
         return ids, embeds, {}
 
     def _embed_boundary_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -217,15 +207,11 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             if window is None or window.closed:
                 continue
             try:
-                closed = window.observe(token_id)
+                window.observe(token_id)
             except ThinkerProtocolError:
                 # An illegal token means the constraint was bypassed. Drop the
                 # window so the next one starts clean instead of wedging here.
                 self._stage0_windows._windows.pop(request_id, None)
-                continue
-            if closed:
-                # The scheduler drops this token. The next window replays it.
-                self._stage0_stop_token[request_id] = token_id
 
     @staticmethod
     def _sampling_request_ids(sampling_metadata: object) -> tuple[object, ...]:
@@ -255,9 +241,9 @@ def _optional_int(primary: object, fallback: object) -> int | None:
 def _window_start(prompt_len: int | None, token_offset: int, span_length: int) -> int | None:
     """Locate the audio window inside one scheduled prefill span.
 
-    The window is the last nine tokens of the append. Anything before it was
-    replayed from the previous window or is the system prefix, and a span that
-    ends before the window belongs entirely to that prefix.
+    The window is the last nine tokens of the append. Anything before it is the
+    system prefix or the previous window's ``<|unit_end|>``, and a span that
+    ends before the window belongs entirely to those.
     """
 
     if prompt_len is None:

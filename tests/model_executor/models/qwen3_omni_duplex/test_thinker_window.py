@@ -11,51 +11,85 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKE
 
 
 def _state(**kwargs) -> ThinkerWindowState:
-    values = {"asr_enabled": False, "max_generated_tokens": 8, "max_text_tokens": 3}
+    values = {"user_signal": "none", "max_generated_tokens": 8, "max_text_tokens": 3}
     values.update(kwargs)
     return ThinkerWindowState(tokens=DUPLEX_TOKENS, **values)
 
 
-def test_listen_feeds_listen_and_unit_end() -> None:
+def test_listen_keeps_the_window_open_for_unit_end() -> None:
     state = _state()
-    step = state.observe(DUPLEX_TOKENS.listen)
+    listen = state.observe(DUPLEX_TOKENS.listen)
 
-    assert step.feed_token_ids == (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)
-    assert step.closed
-    assert not step.end_of_turn
+    assert listen.phase == "post_listen"
+    assert not listen.closed
+    # Only unit_end can follow, and it is the window's stop token.
+    assert state.control_logits({DUPLEX_TOKENS.unit_end: 1.0, DUPLEX_TOKENS.listen: 9.0}) == {
+        DUPLEX_TOKENS.unit_end: 1.0
+    }
+    unit_end = state.observe(DUPLEX_TOKENS.unit_end)
+    assert unit_end.closed
+    assert not unit_end.end_of_turn
 
 
-def test_turn_eos_forces_a_chunk_eos_sample_before_the_window_closes() -> None:
+def test_turn_eos_forces_a_unit_end_sample_before_the_window_closes() -> None:
     state = _state()
-    speak = state.observe(DUPLEX_TOKENS.speak)
+    state.observe(DUPLEX_TOKENS.speak)
     text = state.observe(100)
     turn = state.observe(DUPLEX_TOKENS.turn_eos)
-    chunk = state.observe(DUPLEX_TOKENS.chunk_eos)
+    unit_end = state.observe(DUPLEX_TOKENS.unit_end)
 
-    assert speak.feed_token_ids == (DUPLEX_TOKENS.speak,)
     assert text.text_token_id == 100
     # turn_eos is sampled by the runner and fed like any decode token; it ends
     # the turn but not the window.
-    assert turn.feed_token_ids == (DUPLEX_TOKENS.turn_eos,)
     assert turn.end_of_turn
     assert not turn.closed
-    # The forced chunk_eos is the window's stop token and closes it.
-    assert chunk.feed_token_ids == (DUPLEX_TOKENS.chunk_eos, DUPLEX_TOKENS.unit_end)
-    assert chunk.closed
-    assert chunk.end_of_turn
+    # The forced unit_end is the window's stop token and closes it.
+    assert unit_end.closed
+    assert unit_end.end_of_turn
     with pytest.raises(ThinkerProtocolError):
         state.observe(101)
 
 
-def test_post_turn_eos_keeps_only_chunk_eos() -> None:
+def test_post_turn_eos_keeps_only_unit_end() -> None:
     state = _state()
     state.observe(DUPLEX_TOKENS.speak)
     state.observe(100)
     state.observe(DUPLEX_TOKENS.turn_eos)
 
-    logits = state.control_logits({DUPLEX_TOKENS.chunk_eos: 1.0, DUPLEX_TOKENS.turn_eos: 2.0, 101: 9.0})
+    logits = state.control_logits({DUPLEX_TOKENS.unit_end: 1.0, DUPLEX_TOKENS.turn_eos: 2.0, 101: 9.0})
 
-    assert logits == {DUPLEX_TOKENS.chunk_eos: 1.0}
+    assert logits == {DUPLEX_TOKENS.unit_end: 1.0}
+
+
+def test_activity_signal_opens_the_window_and_hands_over_to_control() -> None:
+    state = _state(user_signal="activity")
+
+    assert state.control_logits({DUPLEX_TOKENS.idle: 1.0, DUPLEX_TOKENS.non_idle: 2.0, 100: 9.0}) == {
+        DUPLEX_TOKENS.idle: 1.0,
+        DUPLEX_TOKENS.non_idle: 2.0,
+    }
+    assert state.observe(DUPLEX_TOKENS.non_idle).phase == "control"
+    with pytest.raises(ThinkerProtocolError, match="control must be"):
+        state.observe(DUPLEX_TOKENS.non_idle)
+
+
+def test_chunk_eos_is_masked_in_every_phase() -> None:
+    logits = {
+        DUPLEX_TOKENS.chunk_eos: 9.0,
+        DUPLEX_TOKENS.unit_end: 1.0,
+        DUPLEX_TOKENS.turn_eos: 1.0,
+        DUPLEX_TOKENS.listen: 1.0,
+        DUPLEX_TOKENS.speak: 1.0,
+        100: 1.0,
+    }
+    speak = _state()
+    assert DUPLEX_TOKENS.chunk_eos not in speak.control_logits(logits)
+    speak.observe(DUPLEX_TOKENS.speak)
+    assert DUPLEX_TOKENS.chunk_eos not in speak.control_logits(logits)
+    speak.observe(100)
+    assert DUPLEX_TOKENS.chunk_eos not in speak.control_logits(logits)
+    with pytest.raises(ThinkerProtocolError, match="reserved token"):
+        speak.observe(DUPLEX_TOKENS.chunk_eos)
 
 
 def test_system2_action_order_and_reserved_text_rejection() -> None:
@@ -70,7 +104,7 @@ def test_system2_action_order_and_reserved_text_rejection() -> None:
 
 
 def test_asr_budget_exposes_only_asr_eos() -> None:
-    state = _state(asr_enabled=True, max_text_tokens=1)
+    state = _state(user_signal="transcript", max_text_tokens=1)
     state.observe(DUPLEX_TOKENS.asr)
     state.observe(100)
 

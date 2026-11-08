@@ -4,12 +4,16 @@
 
 The checkpoint-backed sequence is::
 
-    <|unit_start|> environment [<|asr|> payload <|asr_eos|>]
-    (<|listen|> | <|speak|> [actions] [text] [<|turn_eos|>] <|chunk_eos|>)
+    <|unit_start|> environment [user signal]
+    (<|listen|> | <|speak|> [actions] [text] [<|turn_eos|>])
     <|unit_end|>
 
-This module owns only token legality and forced boundary tokens. Model
-execution supplies embeddings, KV state, and sampled token IDs.
+``<|unit_end|>`` is the one token that ends a window, for LISTEN and SPEAK
+alike, and the model is supervised on it. The user signal block depends on the
+checkpoint: nothing, an ASR transcript, or a single activity flag.
+
+This module owns only token legality. Model execution supplies embeddings, KV
+state, and sampled token IDs.
 """
 
 from __future__ import annotations
@@ -23,16 +27,26 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import (
     DuplexTokenIDs,
 )
 
+UserSignalMode = Literal["none", "transcript", "activity"]
+
 ThinkerPhase = Literal[
+    "activity",
     "asr_start",
     "asr",
     "control",
     "action_or_text",
     "launch_or_text",
     "text",
+    "post_listen",
     "post_turn_eos",
     "closed",
 ]
+
+_START_PHASE: dict[UserSignalMode, ThinkerPhase] = {
+    "none": "control",
+    "transcript": "asr_start",
+    "activity": "activity",
+}
 
 
 class ThinkerProtocolError(ValueError):
@@ -41,10 +55,9 @@ class ThinkerProtocolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ThinkerWindowStep:
-    """One accepted sampled token and the IDs that must enter Thinker KV."""
+    """One accepted sampled token and the state it leaves the window in."""
 
     sampled_token_id: int
-    feed_token_ids: tuple[int, ...]
     phase: ThinkerPhase
     closed: bool
     asr_token_id: int | None = None
@@ -57,10 +70,10 @@ class ThinkerWindowState:
     """Advance one window from its first sampled token through ``<|unit_end|>``."""
 
     tokens: DuplexTokenIDs
-    asr_enabled: bool
+    user_signal: UserSignalMode
     max_generated_tokens: int
     max_text_tokens: int
-    phase: ThinkerPhase = "asr_start"
+    phase: ThinkerPhase = "control"
     generated_tokens: int = 0
     asr_text_tokens: int = 0
     assistant_text_tokens: int = 0
@@ -72,8 +85,9 @@ class ThinkerWindowState:
             raise ValueError("max_generated_tokens must be positive")
         if not 0 <= self.max_text_tokens < self.max_generated_tokens:
             raise ValueError("max_text_tokens must be >= 0 and < max_generated_tokens")
-        if not self.asr_enabled:
-            self.phase = "control"
+        if self.user_signal not in _START_PHASE:
+            raise ValueError(f"unknown user signal mode {self.user_signal!r}")
+        self.phase = _START_PHASE[self.user_signal]
 
     def control_logits(
         self,
@@ -88,6 +102,8 @@ class ThinkerWindowState:
         if self.phase == "closed":
             raise ThinkerProtocolError("window is already closed")
         values = dict(logits)
+        if self.phase == "activity":
+            return self._force_pair(values, self.tokens.idle, self.tokens.non_idle)
         if self.phase == "asr_start":
             return self._force(values, self.tokens.asr)
         if self.phase == "asr":
@@ -99,11 +115,12 @@ class ThinkerWindowState:
             if listen_bias:
                 result[self.tokens.listen] += listen_bias
             return result
-        if self.phase == "post_turn_eos":
-            # The turn ended on ``<|turn_eos|>``; the protocol samples
-            # ``<|chunk_eos|>`` next, and that sample is the window's stop.
-            return self._force(values, self.tokens.chunk_eos)
-        allowed = {self.tokens.chunk_eos, self.tokens.turn_eos}
+        if self.phase in {"post_listen", "post_turn_eos"}:
+            # ``<|listen|>`` and ``<|turn_eos|>`` both end free generation. The
+            # reference runtime force-feeds ``<|unit_end|>`` here; constraining
+            # the next step to it instead makes that token the request's stop.
+            return self._force(values, self.tokens.unit_end)
+        allowed = {self.tokens.unit_end, self.tokens.turn_eos}
         bias: tuple[int, float] | None = None
         if self.phase == "action_or_text":
             allowed.add(self.tokens.launch)
@@ -115,15 +132,17 @@ class ThinkerWindowState:
         elif self.phase == "launch_or_text":
             allowed.add(self.tokens.launch)
             bias = (self.tokens.launch, launch_bias)
-        if self.assistant_text_tokens >= self.max_text_tokens:
-            return self._force(values, self.tokens.chunk_eos)
+        # Spending the last budgeted token on text would end the window by
+        # length instead of on ``<|unit_end|>``, so close it one step early.
+        if self.assistant_text_tokens >= self.max_text_tokens or self.generated_tokens >= self.max_generated_tokens - 1:
+            return self._force(values, self.tokens.unit_end)
         result = self._mask(values, allowed=allowed)
         if bias is not None and bias[1]:
             result[bias[0]] += bias[1]
         return result
 
     def observe(self, token_id: int) -> ThinkerWindowStep:
-        """Accept one sampled token and report every token that must be fed."""
+        """Accept one sampled token and report the phase it leads to."""
 
         if self.phase == "closed":
             raise ThinkerProtocolError("window is already closed")
@@ -136,40 +155,49 @@ class ThinkerWindowState:
         return step
 
     def _observe(self, token_id: int) -> ThinkerWindowStep:
+        if self.phase == "activity":
+            if token_id not in {self.tokens.idle, self.tokens.non_idle}:
+                raise ThinkerProtocolError("user activity must be <|idle|> or <|non_idle|>")
+            self.phase = "control"
+            return self._step(token_id)
         if self.phase == "asr_start":
             self._expect(token_id, self.tokens.asr, "window must start with <|asr|>")
             self.phase = "asr"
-            return self._step(token_id, (token_id,))
+            return self._step(token_id)
         if self.phase == "asr":
             if token_id == self.tokens.asr_eos:
                 self.phase = "control"
-                return self._step(token_id, (token_id,))
+                return self._step(token_id)
             self._reject_reserved(token_id, "reserved token inside ASR payload")
             self.asr_text_tokens += 1
-            return self._step(token_id, (token_id,), asr_token_id=token_id)
+            return self._step(token_id, asr_token_id=token_id)
+        if self.phase in {"post_listen", "post_turn_eos"}:
+            self._expect(token_id, self.tokens.unit_end, "window must close on <|unit_end|>")
+            return self._close(token_id, end_of_turn=self.phase == "post_turn_eos")
         if self.phase == "control":
             if token_id == self.tokens.listen:
-                return self._close((token_id, self.tokens.unit_end))
+                # The window stays open for the constrained ``<|unit_end|>``.
+                self.phase = "post_listen"
+                return self._step(token_id)
             self._expect(token_id, self.tokens.speak, "control must be <|listen|> or <|speak|>")
             self.phase = "action_or_text"
-            return self._step(token_id, (token_id,))
+            return self._step(token_id)
         if self.phase == "action_or_text" and token_id in {self.tokens.launch, self.tokens.cancel}:
             return self._action(token_id)
         if self.phase == "launch_or_text" and token_id == self.tokens.launch:
             return self._action(token_id)
         if self.phase in {"action_or_text", "launch_or_text"}:
             self.phase = "text"
-        if token_id == self.tokens.chunk_eos:
-            # A ``<|chunk_eos|>`` after ``<|turn_eos|>`` closes the turn too.
-            return self._close((token_id, self.tokens.unit_end), end_of_turn=self.phase == "post_turn_eos")
+        if token_id == self.tokens.unit_end:
+            return self._close(token_id)
         if token_id == self.tokens.turn_eos:
-            # The turn ends, but the window closes on the ``<|chunk_eos|>`` the
-            # protocol samples next. The runner feeds this token normally.
+            # The turn ends, but the window closes on the ``<|unit_end|>`` the
+            # next step is constrained to. The runner feeds this token normally.
             self.phase = "post_turn_eos"
-            return self._step(token_id, (token_id,), end_of_turn=True)
+            return self._step(token_id, end_of_turn=True)
         self._reject_reserved(token_id, "reserved token inside assistant text")
         self.assistant_text_tokens += 1
-        return self._step(token_id, (token_id,), text_token_id=token_id)
+        return self._step(token_id, text_token_id=token_id)
 
     def _action(self, token_id: int) -> ThinkerWindowStep:
         if token_id == self.tokens.cancel:
@@ -182,17 +210,15 @@ class ThinkerWindowState:
                 raise ThinkerProtocolError("duplicate <|launch|>")
             self.actions += ("launch",)
             self.phase = "text"
-        return self._step(token_id, (token_id,))
+        return self._step(token_id)
 
     def _action_ids(self) -> set[int]:
         names = {"launch": self.tokens.launch, "cancel": self.tokens.cancel}
         return {names[name] for name in self.actions}
 
-    def _close(self, feed_token_ids: tuple[int, ...], *, end_of_turn: bool = False) -> ThinkerWindowStep:
-        step = self._step(feed_token_ids[0], feed_token_ids, end_of_turn=end_of_turn)
+    def _close(self, token_id: int, *, end_of_turn: bool = False) -> ThinkerWindowStep:
         return ThinkerWindowStep(
-            sampled_token_id=step.sampled_token_id,
-            feed_token_ids=step.feed_token_ids,
+            sampled_token_id=token_id,
             phase="closed",
             closed=True,
             end_of_turn=end_of_turn,
@@ -201,7 +227,6 @@ class ThinkerWindowState:
     def _step(
         self,
         sampled_token_id: int,
-        feed_token_ids: tuple[int, ...],
         *,
         asr_token_id: int | None = None,
         text_token_id: int | None = None,
@@ -209,7 +234,6 @@ class ThinkerWindowState:
     ) -> ThinkerWindowStep:
         return ThinkerWindowStep(
             sampled_token_id=sampled_token_id,
-            feed_token_ids=feed_token_ids,
             phase=self.phase,
             closed=False,
             asr_token_id=asr_token_id,

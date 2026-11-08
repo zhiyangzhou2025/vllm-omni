@@ -100,7 +100,7 @@ def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
         stage_id=0,
         final_stage_id=0,
         segment_finished=True,
-        segment_token_ids=(DUPLEX_TOKENS.listen,),
+        segment_token_ids=(DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end),
         segment_output_metadata={},
         output=None,
     )
@@ -108,7 +108,7 @@ def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
         stage_id=0,
         final_stage_id=0,
         segment_finished=True,
-        segment_token_ids=(DUPLEX_TOKENS.speak,),
+        segment_token_ids=(DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end),
         segment_output_metadata={},
         output=None,
     )
@@ -116,7 +116,7 @@ def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
         stage_id=0,
         final_stage_id=0,
         segment_finished=False,
-        segment_token_ids=(DUPLEX_TOKENS.listen,),
+        segment_token_ids=(DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end),
         segment_output_metadata={},
         output=None,
     )
@@ -181,16 +181,16 @@ def test_later_appends_reserve_the_unit_end_slot() -> None:
     first = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT))
     plugin.commit_append_plan("req")
 
-    # The slot is reserved from the sequence number. Nothing from the previous
-    # window's output is needed: the worker fills the embedding itself.
+    # The slot is reserved from the sequence number, and the token in it is the
+    # literal the scheduler dropped, so nothing has to be carried over.
     second = _plan(plugin, plugin.silence_unit_payload(), seq=2)
 
     window = [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS
     assert first.prompt["prompt_token_ids"] == [*_DEFAULT_PREFIX, *window]
-    # The slot ahead of unit_end is reserved for the stop token the scheduler
-    # drops. The worker fills it; the planner only reserves it.
-    assert second.prompt["prompt_token_ids"] == [DUPLEX_TOKENS.unit_start, DUPLEX_TOKENS.unit_end, *window]
-    assert second.prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 2 + len(window)
+    # Every window stops on unit_end, so the one slot the previous window leaves
+    # behind always holds that token.
+    assert second.prompt["prompt_token_ids"] == [DUPLEX_TOKENS.unit_end, *window]
+    assert second.prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 1 + len(window)
 
 
 def test_window_sampling_stops_on_the_protocol_tokens() -> None:
@@ -200,9 +200,10 @@ def test_window_sampling_stops_on_the_protocol_tokens() -> None:
 
     assert params.max_tokens == 16
     assert params.stop_token_ids == list(WINDOW_STOP_TOKEN_IDS)
-    assert params.stop_token_ids == [DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos]
-    # turn_eos is not a stop: the protocol samples it, then constrains the next
-    # step to chunk_eos, which is the stop.
+    assert params.stop_token_ids == [DUPLEX_TOKENS.unit_end]
+    # Neither listen nor turn_eos stops the request: the protocol samples one of
+    # them and then constrains the next step to unit_end, which is the stop.
+    assert DUPLEX_TOKENS.listen not in params.stop_token_ids
     assert DUPLEX_TOKENS.turn_eos not in params.stop_token_ids
-    assert DUPLEX_TOKENS.unit_end not in params.stop_token_ids
+    assert DUPLEX_TOKENS.chunk_eos not in params.stop_token_ids
     assert params.temperature == 0.0

@@ -33,18 +33,18 @@ def build_audio_window_prompt(
 
     The worker replaces the trailing placeholder IDs with ``<|unit_start|>``,
     audio-boundary embeddings, and the six audio-tower embeddings. Tokens
-    before them are replayed verbatim: the system prefix on the first append,
-    and the previous window's forced boundary tokens after that. The window
+    before them keep their own embeddings: the system prefix on the first
+    append, and the previous window's ``<|unit_end|>`` after that. The window
     count must stay exact because surplus scheduler slots become KV entries.
     """
 
     if not isinstance(payload, Mapping) or payload.get("audio") is None:
         raise ValueError("Qwen3-Omni-Duplex Stage 0 requires one audio payload")
     token_id = DUPLEX_TOKENS.unit_start
-    # Every window but the first closes the previous one. The scheduler drops the
-    # sampled stop token, so the slot ahead of <|unit_end|> is reserved for it and
-    # the worker fills both embeddings.
-    closure = () if seq <= 1 else (token_id, DUPLEX_TOKENS.unit_end)
+    # Every window but the first closes the previous one. Every window stops on
+    # <|unit_end|>, and the scheduler drops that sampled token, so one slot
+    # holding it is all the previous window leaves behind.
+    closure = () if seq <= 1 else (DUPLEX_TOKENS.unit_end,)
     prompt_token_ids = [*prefix_token_ids, *closure, *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS)]
     return build_duplex_append_prompt(
         request_id=request_id,

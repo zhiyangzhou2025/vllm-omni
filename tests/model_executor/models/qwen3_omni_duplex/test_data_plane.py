@@ -21,7 +21,7 @@ def _result(token_ids: list[int], *, finished: bool = False) -> dict[str, object
 
 
 def test_listen_window_projects_as_listen() -> None:
-    (projected,) = Qwen3OmniDuplexDataPlane().project(_result([DUPLEX_TOKENS.listen]))
+    (projected,) = Qwen3OmniDuplexDataPlane().project(_result([DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end]))
 
     assert projected["is_listen"] is True
     assert projected["model_listen"] is True
@@ -29,21 +29,19 @@ def test_listen_window_projects_as_listen() -> None:
 
 
 def test_turn_end_window_projects_as_end_of_turn() -> None:
-    # The protocol samples turn_eos, then constrains chunk_eos as the stop, so
+    # The protocol samples turn_eos, then constrains unit_end as the stop, so
     # the turn-end window's last two tokens are that pair.
     (projected,) = Qwen3OmniDuplexDataPlane().project(
-        _result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.chunk_eos])
+        _result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end])
     )
 
     assert projected["is_listen"] is False
     assert projected["end_of_turn"] is True
 
 
-def test_chunk_end_window_projects_as_neither() -> None:
-    # chunk_eos closes the window but not the turn, and it carries no speech.
-    (projected,) = Qwen3OmniDuplexDataPlane().project(
-        _result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.chunk_eos])
-    )
+def test_mid_turn_speak_window_projects_as_neither() -> None:
+    # unit_end closes the window but not the turn.
+    (projected,) = Qwen3OmniDuplexDataPlane().project(_result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end]))
 
     assert projected["is_listen"] is False
     assert projected["end_of_turn"] is False
@@ -55,10 +53,11 @@ def test_cumulative_tokens_keep_the_turn_end_decision() -> None:
         _result(
             [
                 DUPLEX_TOKENS.listen,
+                DUPLEX_TOKENS.unit_end,
                 DUPLEX_TOKENS.speak,
                 100,
                 DUPLEX_TOKENS.turn_eos,
-                DUPLEX_TOKENS.chunk_eos,
+                DUPLEX_TOKENS.unit_end,
             ]
         )
     )
