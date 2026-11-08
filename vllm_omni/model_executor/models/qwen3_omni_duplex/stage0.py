@@ -41,7 +41,11 @@ def build_audio_window_prompt(
     if not isinstance(payload, Mapping) or payload.get("audio") is None:
         raise ValueError("Qwen3-Omni-Duplex Stage 0 requires one audio payload")
     token_id = DUPLEX_TOKENS.unit_start
-    prompt_token_ids = [*prefix_token_ids, *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS)]
+    # Every window but the first closes the previous one. The scheduler drops the
+    # sampled stop token, so the slot ahead of <|unit_end|> is reserved for it and
+    # the worker fills both embeddings.
+    closure = () if seq <= 1 else (token_id, DUPLEX_TOKENS.unit_end)
+    prompt_token_ids = [*prefix_token_ids, *closure, *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS)]
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,

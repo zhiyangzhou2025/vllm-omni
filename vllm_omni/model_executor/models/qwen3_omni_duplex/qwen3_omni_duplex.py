@@ -20,13 +20,7 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     Stage0Windows,
     ThinkerProtocolError,
 )
-from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS
-
-# The scheduler drops a finished chunk's sampled tokens, so the boundary tokens
-# the protocol appends after the sampled one have to ride back to the engine
-# and be replayed with the next append. The runner forwards exactly the keys a
-# model names here, and only on the step the segment finishes.
-FORCED_TOKEN_KEY = "duplex_forced_token_ids"
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS, DUPLEX_TOKENS
 
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
@@ -34,12 +28,19 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
 
     # The runner only calls prepare_duplex_sampling for models that opt in.
     prefer_model_sampler = True
-    omni_client_multimodal_output_keys = (FORCED_TOKEN_KEY,)
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._stage0_windows = Stage0Windows()
+        # The stop token the scheduler drops. The next window replays it ahead of
+        # <|unit_end|>, and only this worker sees the sampled token.
+        self._stage0_stop_token: dict[str, int] = {}
+        # The parent exposes talker_mtp for every stage, and the runner enables
+        # its MTP path whenever the attribute is a method. Stage 0 is the
+        # thinker: it has no talker, and that path would demand mtp_inputs the
+        # thinker preprocess never produces.
         if self.model_stage == "thinker":
+            self.talker_mtp = None
             self.has_preprocess = True
             self.set_custom_preprocess(self.thinker_preprocess)
 
@@ -85,6 +86,16 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         ids = input_ids.clone()
         ids[window_start:] = window.input_ids
         embeds[window_start:] = window.embeddings.to(dtype=embeds.dtype)
+        # The slot ahead of <|unit_end|> was reserved for the stop token the
+        # scheduler dropped. Fill it from the token this worker sampled. The
+        # runner passes the request id at the top of ``info``, not inside the
+        # duplex payload.
+        request_id = info.get("request_id")
+        stop_token = self._stage0_stop_token.pop(request_id, None) if isinstance(request_id, str) else None
+        if stop_token is not None and window_start >= 2:
+            stop_ids = torch.tensor([stop_token], dtype=torch.long, device=ids.device)
+            ids[window_start - 2] = stop_token
+            embeds[window_start - 2] = self._embed_boundary_tokens(stop_ids).to(dtype=embeds.dtype)
         return ids, embeds, {}
 
     def _embed_boundary_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -139,35 +150,25 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             _mask_illegal_logits(logits[row_idx], window)
 
     def sample(self, logits: torch.Tensor, sampling_metadata: object) -> object:
-        """Sample, then advance the window that produced the token.
+        """Constrain, then let the runner's sampler draw the token.
 
-        The forced boundary tokens are not fed here. The scheduler discards a
-        finished chunk's sampled tokens, and the engine replays the protocol's
-        boundary tokens with the next append.
+        The runner calls this only because ``prefer_model_sampler`` is set, and
+        that flag exists so the runner invokes ``prepare_duplex_sampling`` before
+        sampling. The constraint is already applied to ``logits`` by then. The
+        thinker has no sampler of its own: the parent forwards to the stage
+        module, which does not implement one. Returning ``None`` is the runner's
+        contract for declining the step, and it then samples with its own sampler
+        from the masked logits.
+
+        ``_sample_with_parent`` stays so tests can substitute a deterministic
+        draw. A substitute that returns tokens advances the window here, because
+        no runner calls ``post_sample_talker_mtp`` with those tokens afterwards.
         """
 
         output = self._sample_with_parent(logits, sampling_metadata)
-        if self.model_stage != "thinker" or output is None:
-            return output
-        sampled = getattr(output, "sampled_token_ids", None)
-        if not isinstance(sampled, torch.Tensor) or sampled.ndim != 2:
-            return output
-        req_ids = getattr(getattr(sampling_metadata, "input_batch", None), "req_ids", ())
-        for row_idx, request_id in enumerate(req_ids):
-            if row_idx >= sampled.shape[0]:
-                break
-            token_id = int(sampled[row_idx, 0].item())
-            if token_id < 0:
-                continue
-            window = self._stage0_windows._windows.get(request_id)
-            if window is None or window.closed:
-                continue
-            try:
-                window.observe(token_id)
-            except ThinkerProtocolError:
-                # An illegal token means the constraint was bypassed. Drop the
-                # window so the next one starts clean instead of wedging here.
-                self._stage0_windows._windows.pop(request_id, None)
+        if output is None:
+            return None
+        self._advance_windows(getattr(output, "sampled_token_ids", None), self._sampling_request_ids(sampling_metadata))
         return output
 
     def post_sample_talker_mtp(
@@ -175,54 +176,61 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         *,
         req_ids: list[str],
         req_infos: list[dict[str, Any]],
+        input_ids: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        """Report each closed window's replay tokens on the client channel.
+        """Advance each window with the token the runner sampled.
 
-        The runner calls this after sampling and merges the returned tensor's
-        rows into the step's multimodal outputs, which is the only per-request
-        channel that reaches the engine. A window that is still open reports an
-        empty row; the runner drops empty rows before they leave the worker.
+        The runner calls this after its own sampler and passes the sampled token
+        per request as ``input_ids``. That is the only place the sampled token
+        reaches the model, so the window advances here. The returned rows are
+        empty: the next append reserves its own ``<|unit_end|>`` slot, so nothing
+        has to travel back through the engine.
         """
 
         del req_infos, kwargs
-        # A closed window replays one token after listen or chunk_eos, and two
-        # after turn_eos. The row count has to equal the request count: the
-        # runner slices a tensor per request only when its first dimension
-        # matches the batch. -1 marks a window that is still open.
-        rows = [self._closed_window_replay(request_id) or (-1,) for request_id in req_ids]
-        width = max(len(row) for row in rows)
-        codes = torch.full((len(req_ids), width), -1, dtype=torch.long)
-        for row_idx, row in enumerate(rows):
-            codes[row_idx, : len(row)] = torch.tensor(row, dtype=torch.long)
-        return codes
-
-    def finalize_multimodal_outputs_from_cpu_snapshot(self, snapshot: object) -> dict[str, object]:
-        """Rename the replay rows to the key the engine reads.
-
-        The runner stores this hook's return under ``codes.audio``. The engine
-        only forwards keys the model names, so the rows have to come back under
-        that name.
-        """
-
-        merged = dict(snapshot) if isinstance(snapshot, Mapping) else {}
-        codes = merged.get("codes")
-        audio = codes.get("audio") if isinstance(codes, Mapping) else None
-        if isinstance(audio, list):
-            merged[FORCED_TOKEN_KEY] = audio
-        return merged
-
-    def _closed_window_replay(self, request_id: str) -> tuple[int, ...]:
-        window = self._stage0_windows._windows.get(request_id)
-        if window is None or not window.closed:
-            return ()
-        # The window is spent once its replay tokens are reported. The next
-        # append starts a new one.
-        del self._stage0_windows._windows[request_id]
-        return window.forced_token_ids
+        self._advance_windows(input_ids, req_ids)
+        return torch.full((len(req_ids), 1), -1, dtype=torch.long)
 
     def _sample_with_parent(self, logits: torch.Tensor, sampling_metadata: object) -> object:
-        return super().sample(logits, sampling_metadata)
+        # The runner samples from the masked logits when this returns None.
+        del logits, sampling_metadata
+        return None
+
+    def _advance_windows(self, sampled: object, request_ids: object) -> None:
+        """Move each window to the phase its sampled token produces.
+
+        The sampled token is one column per request. A window that was not
+        constrained this step, or that already closed, is left untouched.
+        """
+
+        if self.model_stage != "thinker" or not isinstance(sampled, torch.Tensor) or not sampled.ndim:
+            return
+        tokens = sampled.reshape(sampled.shape[0], -1) if sampled.ndim > 1 else sampled.unsqueeze(-1)
+        for row_idx, request_id in enumerate(request_ids):
+            if row_idx >= tokens.shape[0]:
+                break
+            token_id = int(tokens[row_idx, 0].item())
+            if token_id < 0:
+                continue
+            window = self._stage0_windows._windows.get(request_id)
+            if window is None or window.closed:
+                continue
+            try:
+                closed = window.observe(token_id)
+            except ThinkerProtocolError:
+                # An illegal token means the constraint was bypassed. Drop the
+                # window so the next one starts clean instead of wedging here.
+                self._stage0_windows._windows.pop(request_id, None)
+                continue
+            if closed:
+                # The scheduler drops this token. The next window replays it.
+                self._stage0_stop_token[request_id] = token_id
+
+    @staticmethod
+    def _sampling_request_ids(sampling_metadata: object) -> tuple[object, ...]:
+        req_ids = getattr(getattr(sampling_metadata, "input_batch", None), "req_ids", ())
+        return tuple(req_ids)
 
     def _duplex_feature_extractor(self) -> Any:
         extractor = getattr(self, "_qwen3_omni_duplex_feature_extractor", None)

@@ -12,6 +12,7 @@ from collections.abc import Iterable, Mapping
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
 
 class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
@@ -53,6 +54,11 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
             text = getattr(completion, "text", "") if getattr(output, "stage_id", 0) == 0 else ""
             if not isinstance(text, str):
                 text = ""
+            # The engine only forwards a finished segment's last sampled token, so
+            # the decision is that token. ``decide_output`` never runs here: the
+            # runner calls it only for stages below the final one, and Stage 0 is
+            # the only stage.
+            decision = _window_decision(completion)
             yield {
                 "supported": True,
                 "data_plane_request_id": request_id,
@@ -66,9 +72,41 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                 "sample_rate_hz": 24000,
                 "history_audio_pcm": None,
                 "history_audio_supported": False,
-                "end_of_turn": bool(output.finished),
+                "is_listen": decision == "listen",
+                "model_listen": decision == "listen",
+                "end_of_turn": decision == "turn_end",
                 "model_turn_id": model_turn_id,
                 "runtime_impl": "qwen3_omni_duplex_stage0",
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
             }
+
+
+def _window_decision(completion: object) -> str | None:
+    """Classify a finished window by the tokens the engine received.
+
+    A window stops on ``<|listen|>`` or ``<|chunk_eos|>``. A turn ends when the
+    stop is the ``<|chunk_eos|>`` the protocol samples right after
+    ``<|turn_eos|>``, so the last two sampled tokens are that pair. Text tokens
+    arrive on earlier steps and never finish a segment.
+    """
+
+    token_ids = _completion_token_ids(completion)
+    if not token_ids:
+        return None
+    last = token_ids[-1]
+    if last == DUPLEX_TOKENS.listen:
+        return "listen"
+    if last == DUPLEX_TOKENS.chunk_eos and len(token_ids) >= 2 and token_ids[-2] == DUPLEX_TOKENS.turn_eos:
+        return "turn_end"
+    return None
+
+
+def _completion_token_ids(completion: object) -> list[int]:
+    raw = getattr(completion, "token_ids", None)
+    if raw is None:
+        return []
+    try:
+        return [int(token_id) for token_id in raw]
+    except (TypeError, ValueError):
+        return []

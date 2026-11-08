@@ -42,14 +42,11 @@ UNIT_DURATION_MS = 480
 # no instructions gets the reference runtime's prompt.
 DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
 SYSTEM_PREFIX_TEMPLATE = "<|im_start|>system\n{instructions}<|im_end|>\n"
-# Tokens a window can sample as its last token. ``unit_end`` is never sampled:
-# the protocol appends it after the sampled token, so stopping on it would let
-# the window run to the token budget.
-WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos, DUPLEX_TOKENS.turn_eos)
-# The worker reports a closed window's replay tokens through the client
-# multimodal channel. The engine cannot derive them: the output it receives
-# carries only the last step's token.
-FORCED_TOKEN_KEY = "duplex_forced_token_ids"
+# Tokens a window can sample as its last token. Only two tokens stop a window:
+# ``<|listen|>`` and ``<|chunk_eos|>``. ``<|turn_eos|>`` does not stop it: the
+# protocol samples it first and then constrains the next step to
+# ``<|chunk_eos|>``, which is the stop token. ``unit_end`` is never sampled.
+WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos)
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
@@ -62,11 +59,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
-        # Prefixes are staged until the stage accepts the append, so a rejected
-        # append does not consume the previous window's boundary tokens.
+        # The system prefix is staged until the stage accepts the first append, so
+        # a rejected append does not consume it.
         self._pending_prefix: dict[str, tuple[int, ...]] = {}
         self._submitted_prefix: dict[str, tuple[int, ...]] = {}
-        self._forced_token_ids: dict[str, tuple[int, ...]] = {}
 
     def configure_sampling_params(
         self,
@@ -108,7 +104,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             exact_samples=INPUT_SAMPLES_PER_UNIT,
             model="Qwen3-Omni-Duplex",
         )
-        prefix = self._prefix_token_ids(request_id, runtime_config)
+        # Only the first append carries tokens of its own: the system prefix.
+        # Later appends close the previous window with ``<|unit_end|>``, which
+        # ``build_audio_window_prompt`` reserves from the sequence number.
+        prefix = () if request_id in self._submitted_prefix else self._system_prefix_token_ids(runtime_config)
         prompt = build_audio_window_prompt(
             request_id=request_id,
             fence=fence,
@@ -158,30 +157,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         prefix = self._pending_prefix.pop(request_id, None)
         if prefix is not None:
             self._submitted_prefix[request_id] = prefix
-
-    def runtime_config_after_model_output(
-        self,
-        current: Mapping[str, object],
-        output_metadata: Mapping[str, object],
-    ) -> dict[str, object] | None:
-        """Record the boundary tokens the next append must replay.
-
-        Stage 0 is the only stage, so the runner never calls ``decide_output``
-        for it. This hook runs on the session mailbox for the final stage, and
-        the runner submits the next append only after it returns.
-        """
-
-        del current
-        request_id = output_metadata.get("request_id")
-        raw = output_metadata.get(FORCED_TOKEN_KEY)
-        if not isinstance(request_id, str):
-            return None
-        token_ids = _token_ids(raw)
-        if token_ids is None:
-            return None
-        # -1 pads a row and marks a window that did not close this step.
-        self._forced_token_ids[request_id] = tuple(token_id for token_id in token_ids if token_id >= 0)
-        return None
 
     def create_session_state(self) -> Qwen3OmniDuplexSessionState:
         return Qwen3OmniDuplexSessionState()
@@ -268,18 +243,6 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return None
         return tuple(int(token_id) for token_id in token_ids)
 
-    def _prefix_token_ids(self, request_id: str, runtime_config: Mapping[str, object]) -> tuple[int, ...]:
-        """Tokens that must enter the KV cache before this window's audio.
-
-        The first append carries the system prefix. Every later append carries
-        the boundary tokens the previous window closed with, because the
-        scheduler discards a finished chunk's sampled tokens.
-        """
-
-        if request_id not in self._submitted_prefix:
-            return self._system_prefix_token_ids(runtime_config)
-        return self._forced_token_ids.pop(request_id, ())
-
     def _system_prefix_token_ids(self, runtime_config: Mapping[str, object]) -> tuple[int, ...]:
         raw = runtime_config.get("system_prefix_token_ids")
         if not isinstance(raw, (list, tuple)) or not raw:
@@ -288,22 +251,3 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return tuple(int(token_id) for token_id in raw)
         except (TypeError, ValueError) as exc:
             raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 system prompt is not encoded") from exc
-
-    def _pending_forced_token_ids(self) -> tuple[int, ...]:
-        return self._forced_token_ids
-
-
-def _token_ids(value: object) -> tuple[int, ...] | None:
-    """Read one request's replay row, whether it arrived as a list or a tensor."""
-
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except (RuntimeError, ValueError):
-            return None
-    if not isinstance(value, (list, tuple)):
-        return None
-    try:
-        return tuple(int(token_id) for token_id in value)
-    except (TypeError, ValueError):
-        return None

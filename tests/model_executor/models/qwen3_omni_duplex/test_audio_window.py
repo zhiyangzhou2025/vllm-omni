@@ -72,7 +72,25 @@ def test_scheduled_span_rejects_positions_outside_window() -> None:
         select_window_span(window, token_offset=8, span_length=2)
 
 
-def test_audio_window_rejects_wrong_payload_shape() -> None:
+def test_audio_window_decodes_base64_payload() -> None:
+    # The duplex append carries the samples as base64 text. The engine never
+    # decodes them, so the worker has to.
+    import base64
+
+    encoded = base64.b64encode(np.zeros(7680, dtype="<f4").tobytes()).decode()
+    window = audio_window_from_duplex(
+        {
+            "data_plane": True,
+            "model_type": "qwen3_omni_duplex",
+            "payload": {"audio": encoded, "sample_rate_hz": 16000},
+        },
+        embed_tokens=_embed,
+        extract_features=_extract,
+        encode_audio=_encode,
+        device=torch.device("cpu"),
+    )
+
+    assert window.input_ids.shape == (9,)
     with pytest.raises(ValueError, match="7680"):
         audio_window_from_duplex(
             {"data_plane": True, "model_type": "qwen3_omni_duplex", "payload": {"audio": b"1234"}},

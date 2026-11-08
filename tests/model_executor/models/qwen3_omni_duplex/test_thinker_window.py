@@ -25,22 +25,37 @@ def test_listen_feeds_listen_and_unit_end() -> None:
     assert not step.end_of_turn
 
 
-def test_speak_text_turn_feeds_forced_boundaries_once() -> None:
+def test_turn_eos_forces_a_chunk_eos_sample_before_the_window_closes() -> None:
     state = _state()
     speak = state.observe(DUPLEX_TOKENS.speak)
     text = state.observe(100)
     turn = state.observe(DUPLEX_TOKENS.turn_eos)
+    chunk = state.observe(DUPLEX_TOKENS.chunk_eos)
 
     assert speak.feed_token_ids == (DUPLEX_TOKENS.speak,)
     assert text.text_token_id == 100
-    assert turn.feed_token_ids == (
-        DUPLEX_TOKENS.turn_eos,
-        DUPLEX_TOKENS.chunk_eos,
-        DUPLEX_TOKENS.unit_end,
-    )
+    # turn_eos is sampled by the runner and fed like any decode token; it ends
+    # the turn but not the window.
+    assert turn.feed_token_ids == (DUPLEX_TOKENS.turn_eos,)
     assert turn.end_of_turn
+    assert not turn.closed
+    # The forced chunk_eos is the window's stop token and closes it.
+    assert chunk.feed_token_ids == (DUPLEX_TOKENS.chunk_eos, DUPLEX_TOKENS.unit_end)
+    assert chunk.closed
+    assert chunk.end_of_turn
     with pytest.raises(ThinkerProtocolError):
         state.observe(101)
+
+
+def test_post_turn_eos_keeps_only_chunk_eos() -> None:
+    state = _state()
+    state.observe(DUPLEX_TOKENS.speak)
+    state.observe(100)
+    state.observe(DUPLEX_TOKENS.turn_eos)
+
+    logits = state.control_logits({DUPLEX_TOKENS.chunk_eos: 1.0, DUPLEX_TOKENS.turn_eos: 2.0, 101: 9.0})
+
+    assert logits == {DUPLEX_TOKENS.chunk_eos: 1.0}
 
 
 def test_system2_action_order_and_reserved_text_rejection() -> None:

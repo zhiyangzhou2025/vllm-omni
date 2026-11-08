@@ -17,6 +17,7 @@ class _Stage(Qwen3OmniDuplexForConditionalGeneration):
     def __init__(self) -> None:
         self.model_stage = "thinker"
         self._stage0_windows = Stage0Windows()
+        self._stage0_stop_token = {}
 
     def _sample_with_parent(self, logits, sampling_metadata):
         return SimpleNamespace(sampled_token_ids=torch.argmax(logits, dim=-1, keepdim=True))
@@ -43,31 +44,39 @@ def test_control_step_can_only_sample_listen_or_speak() -> None:
     assert torch.isneginf(logits[0, DUPLEX_TOKENS.listen - 1])
 
 
-def test_listen_closes_the_window_and_reports_unit_end() -> None:
+def test_listen_closes_the_window() -> None:
     stage = _Stage()
     logits = torch.full((1, DUPLEX_TOKENS.cancel + 1), float("-inf"))
     logits[0, DUPLEX_TOKENS.listen] = 3.0
     stage.prepare_duplex_sampling(logits, None, (_row("req"),))
 
-    stage.sample(logits, _metadata("req"))
-    replay = stage.post_sample_talker_mtp(req_ids=["req"], req_infos=[{}])
+    # The runner samples itself and reports the token through post_sample_talker_mtp.
+    stage.post_sample_talker_mtp(req_ids=["req"], req_infos=[{}], input_ids=torch.tensor([[DUPLEX_TOKENS.listen]]))
 
-    assert replay.tolist() == [[DUPLEX_TOKENS.unit_end]]
-    # The closed window is reported once, so the next step starts clean.
-    assert stage.post_sample_talker_mtp(req_ids=["req"], req_infos=[{}]).tolist() == [[-1]]
+    # The closed window is dropped, so the next step starts a fresh window.
+    assert stage._stage0_windows.window_for("req").state.phase == "control"
+    # The scheduler drops this sampled token; the next window replays it.
+    assert stage._stage0_stop_token["req"] == DUPLEX_TOKENS.listen
 
 
-def test_turn_end_reports_chunk_eos_and_unit_end() -> None:
+def test_turn_eos_forces_chunk_eos_before_the_window_closes() -> None:
     stage = _Stage()
     window = stage._stage0_windows.window_for("req")
     window.observe(DUPLEX_TOKENS.speak)
     window.observe(100)
-    logits = torch.full((1, DUPLEX_TOKENS.cancel + 1), float("-inf"))
-    logits[0, DUPLEX_TOKENS.turn_eos] = 4.0
 
-    stage.sample(logits, _metadata("req"))
-    replay = stage.post_sample_talker_mtp(req_ids=["req"], req_infos=[{}])
+    # The runner samples turn_eos itself and reports it afterwards. The turn
+    # ends here, but the window stays open until the forced chunk_eos.
+    stage.post_sample_talker_mtp(req_ids=["req"], req_infos=[{}], input_ids=torch.tensor([[DUPLEX_TOKENS.turn_eos]]))
+    assert stage._stage0_windows.window_for("req").state.phase == "post_turn_eos"
 
-    # turn_eos is sampled, so the runner feeds it. The two tokens the protocol
-    # appends after it still have to be replayed.
-    assert replay.tolist() == [[DUPLEX_TOKENS.chunk_eos, DUPLEX_TOKENS.unit_end]]
+    # The constraint leaves exactly one legal token on the next step. The test
+    # sampler draws and reports it the way the runner would.
+    logits = torch.full((1, DUPLEX_TOKENS.cancel + 1), 5.0)
+    stage.prepare_duplex_sampling(logits, None, (_row("req"),))
+    sampled = stage.sample(logits, _metadata("req"))
+    assert int(sampled.sampled_token_ids[0, 0]) == DUPLEX_TOKENS.chunk_eos
+
+    # chunk_eos is the window's stop token and only ends the window.
+    assert stage._stage0_windows.window_for("req").state.phase == "control"
+    assert stage._stage0_stop_token["req"] == DUPLEX_TOKENS.chunk_eos

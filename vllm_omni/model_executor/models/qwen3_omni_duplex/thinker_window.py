@@ -30,6 +30,7 @@ ThinkerPhase = Literal[
     "action_or_text",
     "launch_or_text",
     "text",
+    "post_turn_eos",
     "closed",
 ]
 
@@ -98,6 +99,10 @@ class ThinkerWindowState:
             if listen_bias:
                 result[self.tokens.listen] += listen_bias
             return result
+        if self.phase == "post_turn_eos":
+            # The turn ended on ``<|turn_eos|>``; the protocol samples
+            # ``<|chunk_eos|>`` next, and that sample is the window's stop.
+            return self._force(values, self.tokens.chunk_eos)
         allowed = {self.tokens.chunk_eos, self.tokens.turn_eos}
         bias: tuple[int, float] | None = None
         if self.phase == "action_or_text":
@@ -155,9 +160,13 @@ class ThinkerWindowState:
         if self.phase in {"action_or_text", "launch_or_text"}:
             self.phase = "text"
         if token_id == self.tokens.chunk_eos:
-            return self._close((token_id, self.tokens.unit_end))
+            # A ``<|chunk_eos|>`` after ``<|turn_eos|>`` closes the turn too.
+            return self._close((token_id, self.tokens.unit_end), end_of_turn=self.phase == "post_turn_eos")
         if token_id == self.tokens.turn_eos:
-            return self._close((token_id, self.tokens.chunk_eos, self.tokens.unit_end), end_of_turn=True)
+            # The turn ends, but the window closes on the ``<|chunk_eos|>`` the
+            # protocol samples next. The runner feeds this token normally.
+            self.phase = "post_turn_eos"
+            return self._step(token_id, (token_id,), end_of_turn=True)
         self._reject_reserved(token_id, "reserved token inside assistant text")
         self.assistant_text_tokens += 1
         return self._step(token_id, (token_id,), text_token_id=token_id)

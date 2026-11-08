@@ -41,13 +41,18 @@ def _pcm(samples: int) -> dict[str, object]:
     }
 
 
-def _plan(plugin: Qwen3OmniDuplexPlugin, payload: object, prefix: tuple[int, ...] = _DEFAULT_PREFIX):
+def _plan(
+    plugin: Qwen3OmniDuplexPlugin,
+    payload: object,
+    prefix: tuple[int, ...] = _DEFAULT_PREFIX,
+    seq: int = 1,
+):
     return plugin.plan_append(
         request_id="req",
         fence=DuplexFence(session_id="sess"),
         session_config={},
         runtime_config={"system_prefix_token_ids": list(prefix)},
-        seq=1,
+        seq=seq,
         turn_seq=1,
         payload=payload,
         final=False,
@@ -171,27 +176,33 @@ async def test_runtime_config_rejects_reference_audio_and_a_changed_prompt() -> 
         )
 
 
-def test_later_appends_replay_the_closed_windows_boundary_tokens() -> None:
+def test_later_appends_reserve_the_unit_end_slot() -> None:
     plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
     first = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT))
     plugin.commit_append_plan("req")
 
-    plugin.runtime_config_after_model_output({}, {"request_id": "req", "duplex_forced_token_ids": [DUPLEX_TOKENS.unit_end]})
-    second = _plan(plugin, plugin.silence_unit_payload())
+    # The slot is reserved from the sequence number. Nothing from the previous
+    # window's output is needed: the worker fills the embedding itself.
+    second = _plan(plugin, plugin.silence_unit_payload(), seq=2)
 
-    assert first.prompt["prompt_token_ids"][: len(_DEFAULT_PREFIX)] == list(_DEFAULT_PREFIX)
-    assert second.prompt["prompt_token_ids"] == [
-        DUPLEX_TOKENS.unit_end,
-        *([DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS),
-    ]
+    window = [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS
+    assert first.prompt["prompt_token_ids"] == [*_DEFAULT_PREFIX, *window]
+    # The slot ahead of unit_end is reserved for the stop token the scheduler
+    # drops. The worker fills it; the planner only reserves it.
+    assert second.prompt["prompt_token_ids"] == [DUPLEX_TOKENS.unit_start, DUPLEX_TOKENS.unit_end, *window]
+    assert second.prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 2 + len(window)
 
 
-def test_sampling_stops_on_the_sampled_closing_token() -> None:
+def test_window_sampling_stops_on_the_protocol_tokens() -> None:
     plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
 
     (params,) = plugin.configure_sampling_params(runtime_config={}, defaults=(SamplingParams(temperature=0.0),))
 
     assert params.max_tokens == 16
     assert params.stop_token_ids == list(WINDOW_STOP_TOKEN_IDS)
+    assert params.stop_token_ids == [DUPLEX_TOKENS.listen, DUPLEX_TOKENS.chunk_eos]
+    # turn_eos is not a stop: the protocol samples it, then constrains the next
+    # step to chunk_eos, which is the stop.
+    assert DUPLEX_TOKENS.turn_eos not in params.stop_token_ids
     assert DUPLEX_TOKENS.unit_end not in params.stop_token_ids
     assert params.temperature == 0.0

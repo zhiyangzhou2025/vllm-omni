@@ -5,11 +5,20 @@ pipeline: qwen3_omni_duplex_thinker
 session_mode: duplex
 trust_remote_code: true
 enable_prefix_caching: false
-enforce_eager: true
-async_scheduling: false
 
 stages:
   - stage_id: 0
+    # Top-level keys outside DeployConfig are dropped. The scheduler choice and
+    # eager execution are both read from the stage's engine args. Async
+    # scheduling runs the next decode before the segment stop is known, and that
+    # step advances the window with a token the scheduler drops. CUDA graphs
+    # diverge numerically from the eager reference path.
+    async_scheduling: false
+    enforce_eager: true
+    # The checkpoint context is 65536, which needs about 6 GiB of KV cache. An
+    # 80 GiB GPU at 0.8 utilization has about 2 GiB left after the model loads,
+    # and a duplex session only ever holds one window plus its history.
+    max_model_len: 4096
     max_num_seqs: 1
     gpu_memory_utilization: 0.8
     moe_backend: triton

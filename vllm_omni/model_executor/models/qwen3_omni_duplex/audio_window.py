@@ -154,6 +154,12 @@ def _validated_waveform(waveform: np.ndarray, sample_rate_hz: int) -> np.ndarray
 
 
 def _coerce_waveform(audio: object) -> np.ndarray:
+    # The duplex append carries the samples as base64 text. The engine never
+    # decodes them; the worker does, the same way the other duplex models do.
+    if isinstance(audio, str):
+        import base64
+
+        audio = base64.b64decode(audio)
     if isinstance(audio, np.ndarray):
         return audio
     if isinstance(audio, bytes | bytearray | memoryview):
