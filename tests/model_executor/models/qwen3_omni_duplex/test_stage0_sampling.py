@@ -4,9 +4,13 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import Stage0Windows
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
+    Stage0Windows,
+    ThinkerProtocolError,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.qwen3_omni_duplex import (
     Qwen3OmniDuplexForConditionalGeneration,
 )
@@ -57,11 +61,26 @@ def test_listen_forces_unit_end_before_the_window_closes() -> None:
     # token is the request's stop token.
     logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
     stage.prepare_duplex_sampling(logits, None, (_row("req"),))
+    assert int(torch.isfinite(logits[0]).sum()) == 1
     sampled = stage.sample(logits, _metadata("req"))
 
     assert int(sampled.sampled_token_ids[0, 0]) == DUPLEX_TOKENS.unit_end
     # The closed window is dropped, so the next step starts a fresh window.
     assert stage._stage0_windows.window_for("req").state.phase == "control"
+
+
+def test_a_phase_whose_only_token_was_already_masked_fails_loudly() -> None:
+    stage = _Stage()
+    stage._stage0_windows.window_for("req").observe(DUPLEX_TOKENS.listen)
+
+    # ``<|unit_end|>`` is the request's stop token, so an upstream processor can
+    # mask it. Leaving the row all ``-inf`` would make the sampler draw an
+    # arbitrary token that the window then rejects with no trace.
+    logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
+    logits[0, DUPLEX_TOKENS.unit_end] = float("-inf")
+
+    with pytest.raises(ThinkerProtocolError):
+        stage.prepare_duplex_sampling(logits, None, (_row("req"),))
 
 
 def test_text_phases_keep_text_and_drop_only_the_illegal_protocol_tokens() -> None:
@@ -96,6 +115,7 @@ def test_turn_eos_forces_unit_end_before_the_window_closes() -> None:
 
     logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
     stage.prepare_duplex_sampling(logits, None, (_row("req"),))
+    assert int(torch.isfinite(logits[0]).sum()) == 1
     sampled = stage.sample(logits, _metadata("req"))
 
     assert int(sampled.sampled_token_ids[0, 0]) == DUPLEX_TOKENS.unit_end

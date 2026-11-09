@@ -277,6 +277,13 @@ def _mask_illegal_logits(row_logits: torch.Tensor, window: object) -> None:
         return
     masked = row_logits.clone()
     row_logits.fill_(float("-inf"))
-    for token_id in legal:
-        if token_id < vocab:
-            row_logits[token_id] = masked[token_id]
+    candidates = [token_id for token_id in legal if token_id < vocab]
+    for token_id in candidates:
+        row_logits[token_id] = masked[token_id]
+    # The phase keeps only these few candidates, and ``<|unit_end|>`` is often
+    # the only one. It is also the request's stop token, so an upstream
+    # processor can mask it. The row would then be all ``-inf``, the sampler
+    # would draw an arbitrary token, and the window would reject it with no
+    # trace of why.
+    if not bool(torch.isfinite(row_logits[candidates]).any()):
+        raise ThinkerProtocolError(f"no drawable token left among {sorted(candidates)}")
