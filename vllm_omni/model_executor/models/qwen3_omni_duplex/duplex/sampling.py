@@ -77,6 +77,29 @@ def window_decision(token_ids: Sequence[int]) -> str | None:
     return "speak"
 
 
+def window_token_ids(output: object) -> list[int]:
+    """Read a stage output's whole token history, not the step's delta.
+
+    One session is one resumable request, and it runs on DELTA output, so both
+    the stage output's ``token_ids`` and the orchestrator's segment snapshot
+    hold only the step being reported. ``window_decision`` needs the token ahead
+    of ``<|unit_end|>``, which the step that closes a listen window never
+    carries. The Omni output processor attaches the cumulative view for exactly
+    this.
+    """
+
+    completion = next(iter(getattr(output, "outputs", ()) or ()), output)
+    raw = getattr(completion, "cumulative_token_ids", None)
+    if raw is None:
+        raw = getattr(completion, "token_ids", None)
+    if raw is None:
+        return []
+    try:
+        return [int(token_id) for token_id in raw]
+    except (TypeError, ValueError):
+        return []
+
+
 __all__ = [
     "MAX_GENERATED_TOKENS_PER_WINDOW",
     "MAX_TEXT_TOKENS_PER_WINDOW",
@@ -84,4 +107,5 @@ __all__ = [
     "Stage0Windows",
     "ThinkerProtocolError",
     "window_decision",
+    "window_token_ids",
 ]

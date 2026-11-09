@@ -12,7 +12,10 @@ from collections.abc import Iterable, Mapping
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane
-from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import window_decision
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
+    window_decision,
+    window_token_ids,
+)
 
 
 class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
@@ -56,7 +59,7 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                 text = ""
             # ``decide_output`` never runs here: the runner calls it only for
             # stages below the final one, and Stage 0 is the only stage.
-            decision = window_decision(_completion_token_ids(completion))
+            decision = window_decision(window_token_ids(completion))
             yield {
                 "supported": True,
                 "data_plane_request_id": request_id,
@@ -78,13 +81,3 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                 "uses_model_runner_scheduler": True,
                 "runner_kv_backed": True,
             }
-
-
-def _completion_token_ids(completion: object) -> list[int]:
-    raw = getattr(completion, "token_ids", None)
-    if raw is None:
-        return []
-    try:
-        return [int(token_id) for token_id in raw]
-    except (TypeError, ValueError):
-        return []

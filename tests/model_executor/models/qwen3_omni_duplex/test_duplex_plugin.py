@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Contract tests for the Qwen3-Omni-Duplex Stage 0 duplex plugin."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pybase64 as base64
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
@@ -93,33 +95,30 @@ def test_plan_append_rejects_any_other_length(samples: int) -> None:
         _plan(Qwen3OmniDuplexPlugin(lambda *_args: None), _pcm(samples))
 
 
+def _stage_output(token_ids: tuple[int, ...]) -> SimpleNamespace:
+    # DELTA output: the step reports one token, the window lives in the
+    # cumulative history the Omni output processor attaches.
+    completion = SimpleNamespace(token_ids=token_ids[-1:], cumulative_token_ids=token_ids)
+    return SimpleNamespace(outputs=[completion])
+
+
 def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
     plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
 
-    listen = plugin.decide_output(
-        stage_id=0,
-        final_stage_id=0,
-        segment_finished=True,
-        segment_token_ids=(DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end),
-        segment_output_metadata={},
-        output=None,
-    )
-    speak = plugin.decide_output(
-        stage_id=0,
-        final_stage_id=0,
-        segment_finished=True,
-        segment_token_ids=(DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end),
-        segment_output_metadata={},
-        output=None,
-    )
-    unfinished = plugin.decide_output(
-        stage_id=0,
-        final_stage_id=0,
-        segment_finished=False,
-        segment_token_ids=(DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end),
-        segment_output_metadata={},
-        output=None,
-    )
+    def decide(token_ids: tuple[int, ...], *, finished: bool = True) -> object:
+        return plugin.decide_output(
+            stage_id=0,
+            final_stage_id=0,
+            segment_finished=finished,
+            # The orchestrator snapshots only the closing step's token.
+            segment_token_ids=token_ids[-1:],
+            segment_output_metadata={},
+            output=_stage_output(token_ids),
+        )
+
+    listen = decide((DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end))
+    speak = decide((DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end))
+    unfinished = decide((DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end), finished=False)
 
     assert listen is not None and listen.metadata["duplex_native_decision"] == "listen"
     assert listen.metadata["model_listen"] is True
@@ -207,3 +206,6 @@ def test_window_sampling_stops_on_the_protocol_tokens() -> None:
     assert DUPLEX_TOKENS.turn_eos not in params.stop_token_ids
     assert DUPLEX_TOKENS.chunk_eos not in params.stop_token_ids
     assert params.temperature == 0.0
+    # The whole session is one resumable request, so cumulative output would
+    # resend every earlier window's text on every step.
+    assert params.output_kind == RequestOutputKind.DELTA

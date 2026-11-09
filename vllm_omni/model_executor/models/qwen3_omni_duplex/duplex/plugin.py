@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import 
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     MAX_GENERATED_TOKENS_PER_WINDOW,
     window_decision,
+    window_token_ids,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.session import (
     Qwen3OmniDuplexSessionState,
@@ -79,6 +80,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             params = default.clone()
             params.max_tokens = MAX_GENERATED_TOKENS_PER_WINDOW
             params.stop_token_ids = list(WINDOW_STOP_TOKEN_IDS)
+            # The session is one resumable request, so a window boundary never
+            # resets the output state. CUMULATIVE would hand the data plane the
+            # whole session's text again on every decode step.
+            params.output_kind = RequestOutputKind.DELTA
             configured.append(params)
         return tuple(configured)
 
@@ -130,10 +135,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None:
-        del stage_id, final_stage_id, segment_output_metadata, output
+        del stage_id, final_stage_id, segment_token_ids, segment_output_metadata
         if not segment_finished:
             return None
-        decision = window_decision(segment_token_ids)
+        # The segment snapshot holds only the step that closed the window, so
+        # the decision comes from the output's own cumulative token history.
+        decision = window_decision(window_token_ids(output))
         if decision is None:
             return None
         native_decision = "listen" if decision == "listen" else "speak"
