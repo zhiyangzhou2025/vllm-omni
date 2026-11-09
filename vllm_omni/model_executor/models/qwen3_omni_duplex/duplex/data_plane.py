@@ -52,8 +52,9 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         self._user_speech: dict[str, _UserSpeech] = {}
 
     def begin_request(self, request_id: str) -> None:
+        # Called once per append, so once per window. The utterance state spans
+        # windows and must survive; only ``close_session`` ends it.
         self.terminal.discard(request_id)
-        self._user_speech.pop(request_id, None)
 
     def is_terminal(self, request_id: str | None) -> bool:
         return request_id in self.terminal

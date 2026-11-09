@@ -105,11 +105,18 @@ def _activity_window(*, speaking: bool) -> list[tuple[list[int], str]]:
 
 
 def _run(windows: list[list[tuple[list[int], str]]]) -> list[dict[str, object]]:
-    """Feed whole windows through one data plane and collect the user events."""
+    """Feed whole windows through one data plane and collect the user events.
+
+    One window is one append, and the session opens every append with
+    ``begin_request`` on the same resumable request id. Clearing the utterance
+    there restarted it every 480 ms: each window became its own item with one
+    delta, and no utterance ever ended.
+    """
     plane = Qwen3OmniDuplexDataPlane()
     cumulative: list[int] = []
     events: list[dict[str, object]] = []
     for window in windows:
+        plane.begin_request("req")
         for tokens, text in window:
             cumulative.extend(tokens)
             (projected,) = plane.project(_result(list(cumulative), text=text))
