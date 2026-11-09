@@ -14,6 +14,7 @@ from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     window_decision,
+    window_text_is_assistant,
     window_token_ids,
 )
 
@@ -58,12 +59,15 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
             if self.is_terminal(request_id):
                 continue
             completion = next(iter(getattr(output, "outputs", ()) or ()), None)
+            token_ids = window_token_ids(completion)
             text = getattr(completion, "text", "") if getattr(output, "stage_id", 0) == 0 else ""
-            if not isinstance(text, str):
+            # A ``transcript`` window transcribes the user before it decides what
+            # to do. Those tokens are the user's words, not the assistant's.
+            if not isinstance(text, str) or not window_text_is_assistant(token_ids):
                 text = ""
             # ``decide_output`` never runs here: the runner calls it only for
             # stages below the final one, and Stage 0 is the only stage.
-            decision = window_decision(window_token_ids(completion))
+            decision = window_decision(token_ids)
             yield {
                 "supported": True,
                 "data_plane_request_id": request_id,

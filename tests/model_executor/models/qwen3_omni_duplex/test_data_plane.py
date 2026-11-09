@@ -11,10 +11,10 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import 
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
 
-def _result(token_ids: list[int], *, finished: bool = False) -> dict[str, object]:
+def _result(token_ids: list[int], *, finished: bool = False, text: str = "") -> dict[str, object]:
     # The session runs on DELTA output, so the projected step carries only the
     # token it sampled; the window lives in the cumulative view.
-    completion = SimpleNamespace(text="", token_ids=token_ids[-1:], cumulative_token_ids=token_ids)
+    completion = SimpleNamespace(text=text, token_ids=token_ids[-1:], cumulative_token_ids=token_ids)
     output = SimpleNamespace(request_id="req", stage_id=0, finished=finished, outputs=[completion])
     return {"data_plane_outputs": [output]}
 
@@ -71,6 +71,23 @@ def test_earlier_windows_do_not_disturb_the_decision() -> None:
     )
 
     assert projected["end_of_turn"] is True
+
+
+def test_an_asr_token_is_not_reported_as_the_assistant_speaking() -> None:
+    # ``transcript`` windows transcribe the user between asr and asr_eos. The
+    # tokens detokenize like any other text, so projecting them verbatim put the
+    # user's words inside the assistant's transcript, e.g. a turn reading
+    # "<user question> <assistant answer>" as one assistant utterance.
+    (user,) = Qwen3OmniDuplexDataPlane().project(_result([DUPLEX_TOKENS.asr, 100], text="what the user said"))
+    (assistant,) = Qwen3OmniDuplexDataPlane().project(
+        _result(
+            [DUPLEX_TOKENS.asr, 100, DUPLEX_TOKENS.asr_eos, DUPLEX_TOKENS.speak, 101],
+            text="what the model answers",
+        )
+    )
+
+    assert user["text"] == ""
+    assert assistant["text"] == "what the model answers"
 
 
 def test_the_window_is_tagged_with_the_session_model_turn() -> None:

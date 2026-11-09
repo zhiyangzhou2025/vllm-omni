@@ -16,7 +16,7 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.thinker_window import (
     ThinkerWindowState,
     UserSignalMode,
 )
-from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS, DUPLEX_TOKENS
 
 # Worst-case protocol steps a window spends before its first text token, plus
 # the step that closes it. ``transcript`` is the tightest of the three user
@@ -83,6 +83,24 @@ def window_decision(token_ids: Sequence[int]) -> str | None:
     return "speak"
 
 
+def window_text_is_assistant(token_ids: Sequence[int]) -> bool:
+    """Tell whether the newest token is the assistant speaking.
+
+    A ``transcript`` window transcribes the user between ``<|asr|>`` and
+    ``<|asr_eos|>``. Those tokens detokenize like any other text, so reporting
+    them as the assistant's transcript interleaves both speakers in one stream.
+    A text token belongs to whichever phase opener precedes it, and ``<|asr|>``
+    is the only opener that makes it the user's words.
+    """
+
+    if not token_ids or token_ids[-1] in DUPLEX_TOKEN_IDS:
+        return False
+    for token_id in reversed(token_ids[:-1]):
+        if token_id in DUPLEX_TOKEN_IDS:
+            return token_id != DUPLEX_TOKENS.asr
+    return True
+
+
 def window_token_ids(output: object) -> list[int]:
     """Read a stage output's whole token history, not the step's delta.
 
@@ -114,5 +132,6 @@ __all__ = [
     "Stage0Windows",
     "ThinkerProtocolError",
     "window_decision",
+    "window_text_is_assistant",
     "window_token_ids",
 ]
