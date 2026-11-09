@@ -18,10 +18,16 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.thinker_window import (
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
-# The reference runtime caps a window at 16 generated tokens. The text budget is
-# one below that, leaving room for the closing token.
+# Worst-case protocol steps a window spends before its first text token, plus
+# the step that closes it. ``transcript`` is the tightest of the three user
+# signal modes: ``<|asr|>``, ``<|asr_eos|>``, ``<|speak|>``, ``<|cancel|>`` and
+# ``<|launch|>`` can all precede the text phase, and ``<|unit_end|>`` follows it.
+WINDOW_PROTOCOL_OVERHEAD = 6
+# The reference runtime's serving budgets. The generation budget must leave the
+# text phase at least one step once the protocol prefix is paid for, so the text
+# budget is not simply one below it.
 MAX_GENERATED_TOKENS_PER_WINDOW = 16
-MAX_TEXT_TOKENS_PER_WINDOW = MAX_GENERATED_TOKENS_PER_WINDOW - 1
+MAX_TEXT_TOKENS_PER_WINDOW = 8
 
 
 class Stage0Window:
@@ -103,6 +109,7 @@ def window_token_ids(output: object) -> list[int]:
 __all__ = [
     "MAX_GENERATED_TOKENS_PER_WINDOW",
     "MAX_TEXT_TOKENS_PER_WINDOW",
+    "WINDOW_PROTOCOL_OVERHEAD",
     "Stage0Window",
     "Stage0Windows",
     "ThinkerProtocolError",

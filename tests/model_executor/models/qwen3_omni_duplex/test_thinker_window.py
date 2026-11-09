@@ -3,6 +3,10 @@
 
 import pytest
 
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
+    MAX_GENERATED_TOKENS_PER_WINDOW,
+    MAX_TEXT_TOKENS_PER_WINDOW,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.thinker_window import (
     ThinkerProtocolError,
     ThinkerWindowState,
@@ -109,6 +113,36 @@ def test_asr_budget_exposes_only_asr_eos() -> None:
     state.observe(100)
 
     assert set(state.control_logits({DUPLEX_TOKENS.asr_eos: 2.0, 101: 5.0})) == {DUPLEX_TOKENS.asr_eos}
+
+
+def test_the_shipped_budgets_let_the_tightest_window_spend_all_its_text() -> None:
+    # ``transcript`` is the tightest mode: five protocol tokens can precede the
+    # text phase and ``<|unit_end|>`` follows it. A text budget set just below
+    # the generation budget would make that prefix eat into the text, closing
+    # the window early and truncating the turn.
+    state = ThinkerWindowState(
+        tokens=DUPLEX_TOKENS,
+        user_signal="transcript",
+        max_generated_tokens=MAX_GENERATED_TOKENS_PER_WINDOW,
+        max_text_tokens=MAX_TEXT_TOKENS_PER_WINDOW,
+        active_generation=True,
+    )
+    for token_id in (
+        DUPLEX_TOKENS.asr,
+        DUPLEX_TOKENS.asr_eos,
+        DUPLEX_TOKENS.speak,
+        DUPLEX_TOKENS.cancel,
+        DUPLEX_TOKENS.launch,
+    ):
+        state.observe(token_id)
+
+    for _ in range(MAX_TEXT_TOKENS_PER_WINDOW):
+        # Text stays drawable for every budgeted token.
+        assert 100 in state.control_logits({100: 1.0, DUPLEX_TOKENS.unit_end: 2.0})
+        state.observe(100)
+
+    assert state.assistant_text_tokens == MAX_TEXT_TOKENS_PER_WINDOW
+    assert state.observe(DUPLEX_TOKENS.unit_end).closed
 
 
 def test_control_logits_keep_only_listen_and_speak() -> None:
