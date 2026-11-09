@@ -8,7 +8,7 @@ produced by Stage 2 and is not invented here.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane
@@ -45,10 +45,14 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
     def project(self, result: object, *, context: object | None = None) -> Iterable[dict[str, object]]:
         if not isinstance(result, dict):
             return
-        info = context if isinstance(context, Mapping) else {}
-        model_turn_id = info.get("active_response_turn_id")
+        # ``context`` is ``DuplexDataPlaneContext``, a dataclass, so its fields
+        # are attributes. Reading it as a mapping pinned every window to turn 0,
+        # and the session then dropped every model turn after the first as the
+        # late output of a turn it had already completed.
+        model_turn_id = getattr(context, "active_response_turn_id", None)
         if model_turn_id is None:
-            model_turn_id = info.get("turn_id", 0)
+            model_turn_id = getattr(context, "turn_id", 0)
+        response_format = getattr(context, "response_format", "pcm16")
         for output in result.get("data_plane_outputs", []):
             request_id = output.request_id
             if self.is_terminal(request_id):
@@ -65,7 +69,7 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                 "data_plane_request_id": request_id,
                 "text": text,
                 "audio_data": "",
-                "audio_format": info.get("response_format", "pcm16"),
+                "audio_format": response_format,
                 "audio_duration_ms": 0,
                 "audio_text_mark": False,
                 "text_requires_complete_audio": False,

@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import (
     Qwen3OmniDuplexDataPlane,
 )
@@ -70,3 +71,23 @@ def test_earlier_windows_do_not_disturb_the_decision() -> None:
     )
 
     assert projected["end_of_turn"] is True
+
+
+def test_the_window_is_tagged_with_the_session_model_turn() -> None:
+    # The context is a dataclass, not a mapping. Reading it as a mapping tagged
+    # every window with turn 0, and the session dropped each model turn after
+    # the first because 0 was behind the turn it had already completed.
+    window = _result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end])
+
+    (inside,) = Qwen3OmniDuplexDataPlane().project(
+        window, context=DuplexDataPlaneContext(turn_id=7, active_response_turn_id=5, response_format="pcm16")
+    )
+    (between,) = Qwen3OmniDuplexDataPlane().project(
+        window, context=DuplexDataPlaneContext(turn_id=7, active_response_turn_id=None)
+    )
+
+    # A response is open, so the window belongs to the turn that response serves.
+    assert inside["model_turn_id"] == 5
+    assert inside["audio_format"] == "pcm16"
+    # No response is open, so the window opens the session's current turn.
+    assert between["model_turn_id"] == 7
