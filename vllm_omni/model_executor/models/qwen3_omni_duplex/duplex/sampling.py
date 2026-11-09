@@ -83,8 +83,20 @@ def window_decision(token_ids: Sequence[int]) -> str | None:
     return "speak"
 
 
-def window_text_is_assistant(token_ids: Sequence[int]) -> bool:
-    """Tell whether the newest token is the assistant speaking.
+def closed_window_count(token_ids: Sequence[int]) -> int:
+    """Count the windows that already closed, which is also the newest index.
+
+    ``<|unit_end|>`` closes every window, so counting it counts the windows.
+    The count doubles as the zero-based index of the window the next token
+    belongs to, which is how a window is dated: window ``k`` carries the audio
+    of ``[k * UNIT_DURATION_MS, (k + 1) * UNIT_DURATION_MS)``.
+    """
+
+    return sum(1 for token_id in token_ids if token_id == DUPLEX_TOKENS.unit_end)
+
+
+def window_text_role(token_ids: Sequence[int]) -> str | None:
+    """Name whose words the newest token is, or ``None`` for a protocol token.
 
     A ``transcript`` window transcribes the user between ``<|asr|>`` and
     ``<|asr_eos|>``. Those tokens detokenize like any other text, so reporting
@@ -94,11 +106,43 @@ def window_text_is_assistant(token_ids: Sequence[int]) -> bool:
     """
 
     if not token_ids or token_ids[-1] in DUPLEX_TOKEN_IDS:
-        return False
+        return None
     for token_id in reversed(token_ids[:-1]):
         if token_id in DUPLEX_TOKEN_IDS:
-            return token_id != DUPLEX_TOKENS.asr
-    return True
+            return "user" if token_id == DUPLEX_TOKENS.asr else "assistant"
+    return "assistant"
+
+
+def window_user_activity(token_ids: Sequence[int]) -> str | None:
+    """Read an ``activity`` window's ``idle`` / ``non_idle`` verdict.
+
+    The ``activity`` phase forces that pair before anything else, so the
+    verdict is the newest window's opening token. The other two user signal
+    modes open on something else and yield ``None``.
+    """
+
+    window = _newest_window(token_ids)
+    if not window:
+        return None
+    if window[0] == DUPLEX_TOKENS.idle:
+        return "idle"
+    if window[0] == DUPLEX_TOKENS.non_idle:
+        return "non_idle"
+    return None
+
+
+def _newest_window(token_ids: Sequence[int]) -> Sequence[int]:
+    """Slice off the newest window, whether it just closed or is still open.
+
+    The final token is excluded from the search so that the window a closing
+    ``<|unit_end|>`` belongs to is the one returned, rather than an empty slice
+    after it.
+    """
+
+    for offset in range(len(token_ids) - 1, 0, -1):
+        if token_ids[offset - 1] == DUPLEX_TOKENS.unit_end:
+            return token_ids[offset:]
+    return token_ids
 
 
 def window_token_ids(output: object) -> list[int]:
@@ -131,7 +175,9 @@ __all__ = [
     "Stage0Window",
     "Stage0Windows",
     "ThinkerProtocolError",
+    "closed_window_count",
     "window_decision",
-    "window_text_is_assistant",
+    "window_text_role",
     "window_token_ids",
+    "window_user_activity",
 ]

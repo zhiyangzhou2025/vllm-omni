@@ -69,6 +69,10 @@ _SUMMARIZED_TYPES = frozenset(
         "response.speak",
         "rate_limits.updated",
         "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "conversation.item.input_audio_transcription.delta",
+        "conversation.item.input_audio_transcription.completed",
     }
 )
 
@@ -97,9 +101,17 @@ def describe_slot(events: list[dict]) -> str:
     """One line for everything the session reported inside a window's slot."""
 
     notes: list[str] = []
+    # What the model reported about the *user* inside this window.
     for event in events:
-        if event.get("type") == "input_audio_buffer.speech_started":
-            notes.append(f"vad-start@{event.get('audio_start_ms')}ms")
+        kind = event.get("type")
+        if kind == "input_audio_buffer.speech_started":
+            notes.append(f"user-start@{event.get('audio_start_ms')}ms")
+        elif kind == "conversation.item.input_audio_transcription.delta":
+            notes.append(f'user "{event.get("delta")}"')
+        elif kind == "input_audio_buffer.speech_stopped":
+            notes.append(f"user-stop@{event.get('audio_end_ms')}ms")
+        elif kind == "conversation.item.input_audio_transcription.completed":
+            notes.append(f'user-done "{event.get("transcript")}"')
     listens = [event for event in events if event.get("type") == "response.listen"]
     if listens:
         reasons = sorted({str((event.get("response") or {}).get("metadata", {}).get("reason")) for event in listens})
@@ -124,6 +136,57 @@ def describe_slot(events: list[dict]) -> str:
     if extra:
         notes.append("+" + ",".join(extra))
     return "  ".join(notes) if notes else "-"
+
+
+def user_utterances(events: list[dict]) -> dict[str, dict]:
+    """Rebuild each user item the model reported, in the order it was opened."""
+
+    utterances: dict[str, dict] = {}
+    for event in events:
+        item_id = str(event.get("item_id") or "")
+        if not item_id:
+            continue
+        kind = event.get("type")
+        if kind == "input_audio_buffer.speech_started":
+            utterances[item_id] = {
+                "start_ms": event.get("audio_start_ms"),
+                "end_ms": None,
+                "deltas": [],
+                "transcript": None,
+            }
+        elif item_id in utterances:
+            if kind == "conversation.item.input_audio_transcription.delta":
+                utterances[item_id]["deltas"].append(str(event.get("delta") or ""))
+            elif kind == "input_audio_buffer.speech_stopped":
+                utterances[item_id]["end_ms"] = event.get("audio_end_ms")
+            elif kind == "conversation.item.input_audio_transcription.completed":
+                utterances[item_id]["transcript"] = str(event.get("transcript") or "")
+    return utterances
+
+
+def user_speech_order_violations(events: list[dict]) -> list[str]:
+    """Check the contract the four user-side events owe each other."""
+
+    violations: list[str] = []
+    seen_start: set[str] = set()
+    seen_stop: set[str] = set()
+    last_start_ms = -1
+    for event in events:
+        kind = event.get("type")
+        item_id = str(event.get("item_id") or "")
+        if kind == "input_audio_buffer.speech_started":
+            seen_start.add(item_id)
+            start_ms = int(event.get("audio_start_ms") or 0)
+            if start_ms < last_start_ms:
+                violations.append(f"{item_id}: started at {start_ms}ms, behind {last_start_ms}ms")
+            last_start_ms = start_ms
+        elif kind == "conversation.item.input_audio_transcription.delta" and item_id not in seen_start:
+            violations.append(f"{item_id}: delta before started")
+        elif kind == "input_audio_buffer.speech_stopped":
+            seen_stop.add(item_id)
+        elif kind == "conversation.item.input_audio_transcription.completed" and item_id not in seen_stop:
+            violations.append(f"{item_id}: completed before stopped")
+    return violations
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -190,6 +253,13 @@ async def run(args: argparse.Namespace) -> int:
     print("\n--- summary ---")
     print(f"elapsed={time.monotonic() - started:.2f}s events={len(events)}")
     print(json.dumps(dict(sorted(Counter(str(event.get("type")) for event in events).items())), indent=2))
+    for item_id, utterance in user_utterances(events).items():
+        print(
+            f"user {item_id}: [{utterance['start_ms']}, {utterance['end_ms']}]ms "
+            f"deltas={''.join(utterance['deltas'])!r} completed={utterance['transcript']!r}"
+        )
+    violations = user_speech_order_violations(events)
+    print(f"user_speech_order={'ok' if not violations else violations}")
     for turn, transcript in enumerate(transcripts):
         print(f"turn {turn}: {transcript!r}")
     if errors:

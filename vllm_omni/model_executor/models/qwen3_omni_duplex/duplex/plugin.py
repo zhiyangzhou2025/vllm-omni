@@ -29,15 +29,14 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.session import (
     Qwen3OmniDuplexSessionState,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
+    INPUT_SAMPLE_RATE_HZ,
     INPUT_SAMPLES_PER_UNIT,
+    UNIT_DURATION_MS,
     build_audio_window_prompt,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
 PLUGIN_ID = "qwen3_omni_duplex"
-INPUT_SAMPLE_RATE_HZ = 16000
-# One 0.48-second window. The runner's silence continuation uses the same unit.
-UNIT_DURATION_MS = 480
 # The session's system prompt, wrapped in the chat template. A client that sets
 # no instructions gets the reference runtime's prompt.
 DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."

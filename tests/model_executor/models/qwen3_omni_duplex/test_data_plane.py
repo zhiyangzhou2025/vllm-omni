@@ -90,6 +90,98 @@ def test_an_asr_token_is_not_reported_as_the_assistant_speaking() -> None:
     assert assistant["text"] == "what the model answers"
 
 
+def _transcript_window(text: str) -> list[tuple[list[int], str]]:
+    """The steps of one ``transcript`` window; an empty window still pairs asr."""
+    steps: list[tuple[list[int], str]] = [([DUPLEX_TOKENS.asr], "")]
+    if text:
+        steps.append(([100], text))
+    steps.extend([([DUPLEX_TOKENS.asr_eos], ""), ([DUPLEX_TOKENS.speak], ""), ([DUPLEX_TOKENS.unit_end], "")])
+    return steps
+
+
+def _activity_window(*, speaking: bool) -> list[tuple[list[int], str]]:
+    opener = DUPLEX_TOKENS.non_idle if speaking else DUPLEX_TOKENS.idle
+    return [([opener], ""), ([DUPLEX_TOKENS.speak], ""), ([DUPLEX_TOKENS.unit_end], "")]
+
+
+def _run(windows: list[list[tuple[list[int], str]]]) -> list[dict[str, object]]:
+    """Feed whole windows through one data plane and collect the user events."""
+    plane = Qwen3OmniDuplexDataPlane()
+    cumulative: list[int] = []
+    events: list[dict[str, object]] = []
+    for window in windows:
+        for tokens, text in window:
+            cumulative.extend(tokens)
+            (projected,) = plane.project(_result(list(cumulative), text=text))
+            events.extend(projected["user_speech_events"])
+    return events
+
+
+def test_a_transcribing_window_opens_the_user_item_and_streams_its_words() -> None:
+    events = _run([_transcript_window("hello")])
+
+    assert events == [
+        {"kind": "started", "item_id": events[0]["item_id"], "audio_start_ms": 0},
+        {"kind": "delta", "item_id": events[0]["item_id"], "delta": "hello"},
+    ]
+
+
+def test_one_silent_window_is_jitter_and_does_not_end_the_utterance() -> None:
+    # Per-window ASR lags the audio, so a single empty window inside a sentence
+    # is the transcriber catching up, not the user stopping.
+    events = _run([_transcript_window("one"), _transcript_window(""), _transcript_window("two")])
+
+    assert [event["kind"] for event in events] == ["started", "delta", "delta"]
+    assert len({event["item_id"] for event in events}) == 1
+
+
+def test_two_silent_windows_end_the_utterance_at_its_last_word() -> None:
+    events = _run([_transcript_window("hi"), _transcript_window(""), _transcript_window("")])
+
+    assert [event["kind"] for event in events] == ["started", "delta", "stopped", "completed"]
+    # The utterance ended with window 0, not with the silence that proved it.
+    assert events[2]["audio_end_ms"] == 480
+    assert events[3]["transcript"] == "hi"
+
+
+def test_a_second_utterance_is_a_new_item_dated_after_the_first() -> None:
+    events = _run(
+        [
+            _transcript_window("first"),
+            _transcript_window(""),
+            _transcript_window(""),
+            _transcript_window(""),
+            _transcript_window("second"),
+        ]
+    )
+
+    starts = [event for event in events if event["kind"] == "started"]
+    assert [event["audio_start_ms"] for event in starts] == [0, 1920]
+    assert starts[0]["item_id"] != starts[1]["item_id"]
+    assert [event["transcript"] for event in events if event["kind"] == "completed"] == ["first"]
+
+
+def test_an_activity_window_reports_the_user_without_transcribing_them() -> None:
+    events = _run(
+        [
+            _activity_window(speaking=True),
+            _activity_window(speaking=False),
+            _activity_window(speaking=False),
+        ]
+    )
+
+    assert [event["kind"] for event in events] == ["started", "stopped", "completed"]
+    assert events[1]["audio_end_ms"] == 480
+    assert events[2]["transcript"] == ""
+
+
+def test_a_checkpoint_without_a_user_signal_reports_nothing() -> None:
+    # ``none`` windows open straight on the control token: no verdict to relay.
+    events = _run([[([DUPLEX_TOKENS.speak], ""), ([100], "answer"), ([DUPLEX_TOKENS.unit_end], "")]] * 3)
+
+    assert events == []
+
+
 def test_the_window_is_tagged_with_the_session_model_turn() -> None:
     # The context is a dataclass, not a mapping. Reading it as a mapping tagged
     # every window with turn 0, and the session dropped each model turn after

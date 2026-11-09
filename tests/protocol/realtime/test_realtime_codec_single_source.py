@@ -137,7 +137,14 @@ def test_the_duplex_capabilities_reject_unimplemented_turn_detection() -> None:
 # `docs/serving/realtime_duplex_api.md` sorts every message into three tiers.
 # Tier 1 is pure OpenAI and lives in protocol/realtime; Tier 2 (OpenAI names
 # carrying our extensions) and Tier 3 (ours alone) live in protocol/duplex.
-_TIER1_EVENTS = ("SessionUpdated", "ItemAdded", "ItemCreated", "TextDelta", "OutputItemAdded")
+_TIER1_EVENTS = (
+    "SessionUpdated",
+    "ItemAdded",
+    "ItemCreated",
+    "TextDelta",
+    "OutputItemAdded",
+    "InputTranscriptionDelta",
+)
 _TIER2_EVENTS = (
     "SessionCreated",
     "ResponseCreated",
@@ -207,6 +214,23 @@ def test_tier1_carries_no_vllm_omni_extension_fields(name: str) -> None:
             "realtime_item_id",
         }
     )
+
+
+def test_the_input_transcript_delta_streams_what_completed_reports_whole() -> None:
+    """The streaming half of the input transcription pair OpenAI defines."""
+    from vllm_omni.protocol.realtime import events as realtime_events
+
+    delta = realtime_events.InputTranscriptionDelta(item_id="item_user_1", delta="你好")
+
+    assert delta.to_realtime() == {
+        "type": "conversation.item.input_audio_transcription.delta",
+        "event_id": delta.event_id,
+        "item_id": "item_user_1",
+        "content_index": 0,
+        "delta": "你好",
+    }
+    # Same item, same content part as the ``.completed`` that closes the item.
+    assert delta.item_id == realtime_events.InputTranscriptionCompleted(item_id="item_user_1").item_id
 
 
 def test_the_error_code_vocabulary_is_tier3() -> None:

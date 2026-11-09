@@ -17,6 +17,11 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin import (
     WINDOW_STOP_TOKEN_IDS,
     Qwen3OmniDuplexPlugin,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
+    closed_window_count,
+    window_text_role,
+    window_user_activity,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
     QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
 )
@@ -209,3 +214,38 @@ def test_window_sampling_stops_on_the_protocol_tokens() -> None:
     # The whole session is one resumable request, so cumulative output would
     # resend every earlier window's text on every step.
     assert params.output_kind == RequestOutputKind.DELTA
+
+
+def test_a_window_is_dated_by_the_unit_ends_before_it() -> None:
+    # Window k carries the audio of [k * 480 ms, (k + 1) * 480 ms), so the
+    # count of closed windows is also the index of the one being decoded.
+    assert closed_window_count([]) == 0
+    assert closed_window_count([DUPLEX_TOKENS.speak, 100]) == 0
+    assert closed_window_count([DUPLEX_TOKENS.speak, DUPLEX_TOKENS.unit_end]) == 1
+    assert closed_window_count([DUPLEX_TOKENS.unit_end, DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end]) == 2
+
+
+def test_text_belongs_to_whichever_phase_opened_it() -> None:
+    assert window_text_role([DUPLEX_TOKENS.asr, 100]) == "user"
+    assert window_text_role([DUPLEX_TOKENS.asr, 100, DUPLEX_TOKENS.asr_eos, DUPLEX_TOKENS.speak, 101]) == "assistant"
+    # A protocol token is nobody's words.
+    assert window_text_role([DUPLEX_TOKENS.asr, 100, DUPLEX_TOKENS.asr_eos]) is None
+    assert window_text_role([]) is None
+
+
+def test_only_an_activity_window_carries_a_user_activity_verdict() -> None:
+    # The activity phase forces idle/non_idle before anything else, so the
+    # verdict is the window's opening token.
+    assert window_user_activity([DUPLEX_TOKENS.non_idle, DUPLEX_TOKENS.speak]) == "non_idle"
+    assert window_user_activity([DUPLEX_TOKENS.idle, DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end]) == "idle"
+    # transcript opens on asr, none opens on the control token.
+    assert window_user_activity([DUPLEX_TOKENS.asr, 100]) is None
+    assert window_user_activity([DUPLEX_TOKENS.speak, 100]) is None
+
+
+def test_an_earlier_window_does_not_lend_its_verdict_to_the_next() -> None:
+    closed = [DUPLEX_TOKENS.non_idle, DUPLEX_TOKENS.speak, DUPLEX_TOKENS.unit_end]
+
+    # The closing step still reads its own window, not the empty slice after it.
+    assert window_user_activity(closed) == "non_idle"
+    assert window_user_activity([*closed, DUPLEX_TOKENS.idle]) == "idle"

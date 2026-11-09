@@ -51,6 +51,7 @@ from vllm_omni.engine.duplex.events import (
     InputCleared,
     InputCommitted,
     InputTranscriptionCompleted,
+    InputTranscriptionDelta,
     ItemAdded,
     ItemCreated,
     ItemDeleted,
@@ -166,6 +167,12 @@ class RealtimeProjectionState:
     input_audio_buffer_has_audio: bool = False
     input_audio_buffer_had_non_speech: bool = False
     input_audio_buffer_transcript_parts: list[str] = field(default_factory=list)
+    #: Where a user item belongs in the conversation, captured when its speech
+    #: *started*. An utterance that overlaps the assistant's answer is only
+    #: committed after that answer's item exists, and chaining it there would
+    #: claim the user waited their turn. Keyed by the item id the
+    #: ``speech_started`` announced.
+    input_item_anchors: dict[str, str | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.default_payload is not None:
@@ -259,6 +266,11 @@ def _response_item_text_content_part(*, text: str = "") -> dict[str, object]:
     return {"type": "output_text", "text": text}
 
 
+#: Distinguishes "caller said nothing about the position" from an explicit
+#: ``None``, which means the item belongs at the head of the conversation.
+_UNSET = object()
+
+
 def _previous_item_id(state: RealtimeProjectionState, item_id: str) -> str | None:
     previous: str | None = None
     for known_id in state.conversation_items:
@@ -277,26 +289,37 @@ def _item_snapshot(item: Mapping[str, object]) -> dict[str, object]:
 
 def _conversation_item_added_events(state: RealtimeProjectionState, item: dict[str, object]) -> list[DuplexEvent]:
     item_id = item.get("id")
-    explicit_previous_item_id = item.pop("_previous_item_id", None)
+    explicit_previous_item_id = item.pop("_previous_item_id", _UNSET)
+    # ``None`` is a real override --- the item belongs at the head of the
+    # conversation --- so only the sentinel falls back to the latest item.
     previous_item_id = (
-        explicit_previous_item_id if isinstance(explicit_previous_item_id, str) else state.last_conversation_item_id
+        explicit_previous_item_id
+        if isinstance(explicit_previous_item_id, str) or explicit_previous_item_id is None
+        else state.last_conversation_item_id
     )
     if isinstance(item_id, str) and item_id:
         state.last_conversation_item_id = item_id
     snapshot = _item_snapshot(item)
+    resolved = cast("str | None", previous_item_id)
     return [
-        ItemAdded(previous_item_id=previous_item_id, item=snapshot),
-        ItemCreated(previous_item_id=previous_item_id, item=snapshot),
+        ItemAdded(previous_item_id=resolved, item=snapshot),
+        ItemCreated(previous_item_id=resolved, item=snapshot),
     ]
 
 
-def _conversation_item_done_event(state: RealtimeProjectionState, item: dict[str, object]) -> ItemDone:
+def _conversation_item_done_event(
+    state: RealtimeProjectionState,
+    item: dict[str, object],
+    *,
+    previous_item_id: object = _UNSET,
+) -> ItemDone:
     item_id = item.get("id")
-    previous_item_id = _previous_item_id(state, item_id) if isinstance(item_id, str) else None
+    if previous_item_id is _UNSET:
+        previous_item_id = _previous_item_id(state, item_id) if isinstance(item_id, str) else None
     if isinstance(item_id, str) and item_id:
         state.conversation_items[item_id] = item
         state.last_conversation_item_id = item_id
-    return ItemDone(previous_item_id=previous_item_id, item=_item_snapshot(item))
+    return ItemDone(previous_item_id=cast("str | None", previous_item_id), item=_item_snapshot(item))
 
 
 def _remove_conversation_item(state: RealtimeProjectionState, item_id: str) -> bool:
@@ -1021,6 +1044,12 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                 transcript=transcript,
             )
         ]
+    if event_type == "input.transcript_delta":
+        delta = event.get("delta")
+        item_id = event.get("realtime_item_id")
+        if not isinstance(delta, str) or not delta or not isinstance(item_id, str) or not item_id:
+            return []
+        return [InputTranscriptionDelta(item_id=item_id, delta=delta)]
     if event_type == "input.committed":
         event_item_id = event.get("realtime_item_id")
         item_id = _acknowledge_pending_commit_item_id(
@@ -1028,6 +1057,10 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         )
         if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
             state.pending_commit_item_ids.remove(event_item_id)
+        # An utterance that overlapped the assistant is only committed once the
+        # assistant's item exists; where it belongs was decided when its speech
+        # started.
+        anchor = state.input_item_anchors.pop(item_id, _UNSET)
         committed_item = state.conversation_items.get(item_id)
         commit_events: list[DuplexEvent] = []
         if committed_item is None:
@@ -1046,17 +1079,20 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                     else _user_item_content_from_duplex_message(message)
                 ),
             }
+            if anchor is not _UNSET:
+                created_commit_item["_previous_item_id"] = anchor
             committed_item = created_commit_item
             state.conversation_items[item_id] = committed_item
             commit_events.extend(_conversation_item_added_events(state, committed_item))
         committed_item["status"] = "completed"
+        previous_item_id = anchor if anchor is not _UNSET else _previous_item_id(state, item_id)
         commit_events.append(
-            InputCommitted(previous_item_id=_previous_item_id(state, item_id), item_id=item_id, details=event)
+            InputCommitted(previous_item_id=cast("str | None", previous_item_id), item_id=item_id, details=event)
         )
         transcription_event = _input_audio_transcription_completed_event(item_id, committed_item)
         if transcription_event is not None:
             commit_events.append(transcription_event)
-        commit_events.append(_conversation_item_done_event(state, committed_item))
+        commit_events.append(_conversation_item_done_event(state, committed_item, previous_item_id=previous_item_id))
         return commit_events
     if event_type == "input.cancelled":
         return [InputCleared()]
@@ -1161,11 +1197,10 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
     if event_type == "function_call.done":
         return _function_call_done_events(state, event)
     if event_type == "input_audio_buffer.speech_started":
-        return [
-            SpeechStarted(
-                audio_start_ms=_int_or(event.get("audio_start_ms")), item_id=_str_or_none(event.get("item_id"))
-            )
-        ]
+        started_item_id = _str_or_none(event.get("item_id"))
+        if started_item_id is not None:
+            state.input_item_anchors[started_item_id] = state.last_conversation_item_id
+        return [SpeechStarted(audio_start_ms=_int_or(event.get("audio_start_ms")), item_id=started_item_id)]
     if event_type == "input_audio_buffer.speech_stopped":
         return [
             SpeechStopped(audio_end_ms=_int_or(event.get("audio_end_ms")), item_id=_str_or_none(event.get("item_id")))
@@ -1306,6 +1341,7 @@ def note_input_append(
     *,
     vad_result: TurnDetectionResult | None = None,
     allows_video_without_audio: bool = False,
+    model_native_input_speech: bool = False,
 ) -> list[DuplexEvent]:
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
@@ -1314,6 +1350,12 @@ def note_input_append(
     ``vad_result`` is the ``TurnDetectionResult`` when server VAD is active. The
     returned events are ``input_audio_buffer.speech_started`` /
     ``speech_stopped`` exactly as the old translator produced them.
+
+    ``model_native_input_speech`` says the model is the only judge of when the
+    user speaks. Without VAD the fallback below reads "the client sent audio"
+    as "speech began", which is not a judgement at all; worse, it latches
+    ``input_speech_started`` and mints an item id, so the model's own verdict
+    would be swallowed as a duplicate and never paired with a stop.
     """
     audio = payload.get("audio")
     looks_like_speech = bool(vad_result.is_speech) if vad_result is not None else payload.get("is_speech") is not False
@@ -1357,7 +1399,7 @@ def note_input_append(
                     audio_end_ms=stop_ms,
                 )
             )
-    elif looks_like_speech:
+    elif looks_like_speech and not model_native_input_speech:
         events.extend(emit_input_speech_started(state, payload.get("audio_start_ms", 0)))
     if looks_like_speech:
         _remember_input_transcript_hint(state, payload)

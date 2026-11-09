@@ -1169,6 +1169,9 @@ class ModelChannel:
                 session_id=duplex_session_id_from_request_id(data_plane_request_id),
                 assistant_text=context_text,
             )
+        # A window reports on the user whether the model listens or speaks, and
+        # the listen branch below returns, so this comes first.
+        self._emit_user_speech_events(model_result)
         if is_listen is True:
             return await self._on_model_listen(
                 model_result,
@@ -1561,6 +1564,51 @@ class ModelChannel:
             metadata["response_request_metrics"] = dict(response_request_metrics)
         if metadata:
             payload["vllm_omni"] = metadata
+
+    def _emit_user_speech_events(self, model_result: dict[str, object]) -> None:
+        """Relay a window's verdict on the *user* onto the input stream.
+
+        A model-native duplex model hears the user while it answers, so its
+        judgement of when they spoke and what they said is the only one the
+        session has. Each verdict is one standard Realtime fact; the server
+        adds no interpretation of its own.
+        """
+        records = model_result.get("user_speech_events")
+        if not isinstance(records, list):
+            return
+        session = self._ctx.session
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            item_id = record.get("item_id")
+            if not isinstance(item_id, str) or not item_id:
+                continue
+            kind = record.get("kind")
+            if kind == "completed":
+                self._out.emit(
+                    helpers.audio_committed_payload(
+                        session,
+                        realtime_item_id=item_id,
+                        transcript=record.get("transcript"),
+                    )
+                )
+                continue
+            payload: dict[str, object] = {"session_id": session.session_id, "epoch": session.epoch}
+            if kind == "started":
+                payload["type"] = "input_audio_buffer.speech_started"
+                payload["item_id"] = item_id
+                payload["audio_start_ms"] = record.get("audio_start_ms", 0)
+            elif kind == "stopped":
+                payload["type"] = "input_audio_buffer.speech_stopped"
+                payload["item_id"] = item_id
+                payload["audio_end_ms"] = record.get("audio_end_ms", 0)
+            elif kind == "delta":
+                payload["type"] = "input.transcript_delta"
+                payload["realtime_item_id"] = item_id
+                payload["delta"] = record.get("delta", "")
+            else:
+                continue
+            self._out.emit(payload)
 
     # ------------------------------------------------------------------ #
     # Silence continuation                                               #

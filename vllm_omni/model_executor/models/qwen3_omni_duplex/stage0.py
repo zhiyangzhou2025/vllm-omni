@@ -11,6 +11,10 @@ from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
 INPUT_SAMPLES_PER_UNIT = 7680
+INPUT_SAMPLE_RATE_HZ = 16000
+# One 0.48-second window: ``INPUT_SAMPLES_PER_UNIT / INPUT_SAMPLE_RATE_HZ``. It
+# is also the clock the user-side event timestamps are counted in.
+UNIT_DURATION_MS = 480
 AUDIO_TOKENS_PER_UNIT = 6
 AUDIO_BOUNDARY_TOKENS = 2
 UNIT_START_TOKENS = 1

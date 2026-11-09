@@ -1338,6 +1338,7 @@ class DuplexSessionRunner:
                 event,
                 vad_result=vad_result,
                 allows_video_without_audio=session.capabilities.allows_video_without_audio(),
+                model_native_input_speech=session.capabilities.reports_model_native_input_speech(),
             )
         )
         if self.run.closing or session.state != DuplexSessionState.OPEN:

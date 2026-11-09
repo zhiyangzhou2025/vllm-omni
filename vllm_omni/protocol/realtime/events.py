@@ -10,7 +10,7 @@ live here, away from whoever owns the session. The stateful part (response and
 item ids, content-part bookkeeping) is consumed when the events are
 *constructed*, by the consumer.
 
-This module holds the 30 events OpenAI's Realtime API defines. vLLM-Omni's own
+This module holds the 31 events OpenAI's Realtime API defines. vLLM-Omni's own
 additions to the wire (listen/speak turn-taking, playback acknowledgement,
 session resume) are a separate vocabulary in
 ``vllm_omni.protocol.duplex.events``, so a consumer that only speaks GA does
@@ -373,6 +373,19 @@ class ItemTruncated(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InputTranscriptionDelta(RealtimeEvent):
+    wire_type = "conversation.item.input_audio_transcription.delta"
+
+    item_id: str | None = None  # type: ignore[assignment]
+    content_index: int = 0
+    delta: str = ""
+
+    @property
+    def text(self) -> str | None:
+        return self.delta
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InputTranscriptionCompleted(RealtimeEvent):
     wire_type = "conversation.item.input_audio_transcription.completed"
 
@@ -440,6 +453,7 @@ __all__ = [
     "InputCleared",
     "InputCommitted",
     "InputTranscriptionCompleted",
+    "InputTranscriptionDelta",
     "ItemAdded",
     "ItemCreated",
     "ItemDeleted",

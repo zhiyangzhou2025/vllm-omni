@@ -4,7 +4,7 @@
 """The event vocabulary one duplex session speaks, assembled from two layers.
 
 The classes themselves no longer live here. ``vllm_omni.protocol.duplex.events``
-carries the whole vocabulary --- 21 Tier 1 classes re-exported from
+carries the whole vocabulary --- 22 Tier 1 classes re-exported from
 ``vllm_omni.protocol.realtime.events``, 9 Tier 2 ones and 12 Tier 3 ones --- so
 a non-duplex Realtime consumer can take the Tier 1 half and its wire rendering
 without the duplex session control plane (RFC #6592 P0a). The engine imports
@@ -39,6 +39,7 @@ from vllm_omni.protocol.duplex.events import (
     InputCleared,
     InputCommitted,
     InputTranscriptionCompleted,
+    InputTranscriptionDelta,
     ItemAdded,
     ItemCreated,
     ItemDeleted,
@@ -120,6 +121,7 @@ __all__ = [
     "InputCleared",
     "InputCommitted",
     "InputTranscriptionCompleted",
+    "InputTranscriptionDelta",
     "ItemAdded",
     "ItemCreated",
     "ItemDeleted",

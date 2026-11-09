@@ -862,7 +862,7 @@ work unmodified. The overlap falls into the three tiers used by the event catalo
 | Direction | Messages |
 | --- | --- |
 | Client → server | `session.update`, `input_audio_buffer.append` / `.commit` / `.clear`, `conversation.item.create` / `.retrieve` / `.truncate` / `.delete`, `response.create`, `response.cancel`, `output_audio_buffer.clear` (OpenAI: WebRTC-only; here also a WebSocket event) |
-| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.output_audio.delta` / `.done`, `response.output_audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
+| Server → client | `error` (same `{type, code, message, event_id, param}` envelope and the same classes `invalid_request_error` / `server_error` / `rate_limit_error`), `session.created`, `session.updated`, `input_audio_buffer.committed` / `.cleared` / `.speech_started` / `.speech_stopped`, `conversation.item.created` / `.added` / `.done` / `.deleted` / `.retrieved` / `.truncated`, `conversation.item.input_audio_transcription.delta` / `.completed`, `response.created`, `response.done`, `response.output_item.added` / `.done`, `response.content_part.added` / `.done`, `response.output_audio.delta` / `.done`, `response.output_audio_transcript.delta` / `.done`, `response.output_text.delta` / `.done`, `response.function_call_arguments.delta` / `.done`, `rate_limits.updated`, `output_audio_buffer.cleared` |
 | Session fields | `model`, `modalities` / `output_modalities`, `instructions`, `voice`, `input_audio_format` / `output_audio_format` (beta spelling) **and** `audio.input.format` / `audio.output.format` objects (GA spelling), `turn_detection.server_vad {threshold, prefix_padding_ms, silence_duration_ms}`, `input_audio_transcription`, `input_audio_noise_reduction`, `tools`, `tool_choice`, `temperature`, `max_response_output_tokens`, `speed`, `tracing` |
 | Object shapes | `realtime.session`, `realtime.item`, `realtime.response`; item content parts `input_text` / `input_audio` / `output_text` / `output_audio`; `function_call` and `function_call_output` items; `previous_item_id` chaining; `output_index` / `content_index` addressing |
 | Sequencing | `response.created → output_item.added → content_part.added → deltas → *.done → content_part.done → output_item.done → response.done → rate_limits.updated`; `speech_started → speech_stopped → committed` |
@@ -894,6 +894,28 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
+- **The model draws the user's item boundaries** on a model-native duplex
+  session (`capabilities.signal_sources == ["model_native"]`), not the client's
+  commit and not a server VAD — neither exists there. The model judges the user
+  once per audio window (Qwen3-Omni-Duplex Stage 0: every 480 ms) while it
+  answers, and each judgement is relayed as one standard event:
+  `input_audio_buffer.speech_started` → `conversation.item.input_audio_transcription.delta`
+  × N → `input_audio_buffer.speech_stopped` → `input_audio_buffer.committed` →
+  `.completed` → `conversation.item.done`. A checkpoint that transcribes
+  (`user_signal=transcript`) sends the deltas; one that only reports activity
+  (`user_signal=activity`) sends the same boundaries with no delta and an empty
+  transcript; one with `user_signal=none` sends none of them. The boundary is
+  the model's own verdict over a two-window run (960 ms at 480 ms windows): one
+  empty window is the transcriber catching up, not a pause. The server adds no
+  segmentation policy of its own — a client that wants different boundaries
+  re-segments the deltas it receives.
+- **Overlap is resolved by `audio_start_ms`, not by `previous_item_id`.** A
+  full-duplex user can start speaking while the assistant is still answering, so
+  their item is only committed after the assistant's item already exists.
+  `previous_item_id` is the position the item held when its speech *started*,
+  which is the most honest answer the linked list can give; the interval
+  `[audio_start_ms, audio_end_ms]` is the one that may genuinely overlap a
+  response's `created`→`done` span. Read the milliseconds, not the chain.
 - `turn_detection.interrupt_response=false` is rejected; the VAD runs per
   session (Silero) and implies `overlap_policy=barge_in_on_speech`.
   `semantic_vad` (Silero + Smart Turn v3.2, `eagerness` low/medium/high/auto;
@@ -1033,13 +1055,14 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
 | `session.expired` | 3 | Engine lease reaped (`disconnect_grace_expired`, `idle_ttl_expired`); socket closes after it. |
 | `session.resync_required` | 3 | Replay impossible (`journal_gap` / `journal_overflow`); client must start a new session. |
-| `input_audio_buffer.speech_started` | 1 | Speech onset detected (server VAD, client hint, or RMS heuristic). |
+| `input_audio_buffer.speech_started` | 1 | Speech onset detected (server VAD, client hint, RMS heuristic, or the model's own per-window verdict). |
 | `input_audio_buffer.speech_stopped` | 1 | Speech end detected. |
 | `input_audio_buffer.committed` | 2 | Commit accepted. OpenAI name; wraps the native `input.committed` payload under `event` (`turn_id`, `epoch`, `response_create_deferred`, ...). |
 | `input_audio_buffer.cleared` | 1 | Input buffer cleared (after `input_audio_buffer.clear` or `input.cancel`). |
 | `conversation.item.added` | 2 | Item entered history (GA spelling). OpenAI name; carries `previous_item_id` and echoes the originating event. |
 | `conversation.item.created` | 2 | Same as `conversation.item.added` in the beta spelling; both are emitted. |
 | `conversation.item.done` | 2 | Item finalized (GA spelling). |
+| `conversation.item.input_audio_transcription.delta` | 1 | One increment of a user audio item's transcript, while they are still speaking (model-native duplex only). |
 | `conversation.item.input_audio_transcription.completed` | 1 | Transcript of a committed user audio item (model-produced). |
 | `conversation.item.deleted` | 2 | Reply to `conversation.item.delete` (echoes the request under `event`). |
 | `conversation.item.retrieved` | 1 | Reply to `conversation.item.retrieve`. |
@@ -1816,6 +1839,7 @@ them out into typed events before they reach a client.
 | Internal event | Realtime projection |
 | --- | --- |
 | `input.committed` | `conversation.item.added` / `conversation.item.created`, `input_audio_buffer.committed`, `conversation.item.input_audio_transcription.completed`, `conversation.item.done` |
+| `input.transcript_delta` | `conversation.item.input_audio_transcription.delta` |
 | `input.cancelled` | `input_audio_buffer.cleared` |
 | `response.output_audio.delta` (with `audio_transcript`) | optional `response.speak`, then `response.output_audio.delta` and `response.output_audio_transcript.delta` |
 | `response.output_audio.done` / `response.output_text.done` | `response.output_audio.done` / `response.output_text.done` |

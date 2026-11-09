@@ -196,6 +196,10 @@ class DuplexCapabilities:
         """Whether video without speech/audio is legal turn content (AURA video-compulsory)."""
         return self.accepts_input_modality("video") and "audio" not in self.required_input_modalities
 
+    def reports_model_native_input_speech(self) -> bool:
+        """Whether the model alone decides when the user starts and stops speaking."""
+        return set(self.signal_sources) == {"model_native"}
+
     def validate_append_modalities(self, *, has_audio: bool, has_video: bool) -> str | None:
         """Return an error message when the append modalities violate this contract."""
         if not has_audio and not has_video:
