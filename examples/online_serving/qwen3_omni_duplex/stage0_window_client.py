@@ -5,7 +5,8 @@
 
 Every append is one 0.48-second window, paced like a live microphone. The
 script prints what went into each window and what the session reported back
-inside that window's slot, then the transcript of every model turn.
+inside that window's slot, then one line per user utterance and per model turn
+in the order they opened.
 
 The protocol carries no window index, so a window's output is taken to be the
 events that arrived between its append and the next one. Stage 0 keeps up with
@@ -138,30 +139,57 @@ def describe_slot(events: list[dict]) -> str:
     return "  ".join(notes) if notes else "-"
 
 
-def user_utterances(events: list[dict]) -> dict[str, dict]:
-    """Rebuild each user item the model reported, in the order it was opened."""
+def conversation_timeline(events: list[dict], arrivals: list[float]) -> list[str]:
+    """One line per user utterance and per model turn, ordered by when it opened.
 
-    utterances: dict[str, dict] = {}
-    for event in events:
-        item_id = str(event.get("item_id") or "")
-        if not item_id:
-            continue
+    The two sides share no clock. The user's milliseconds are audio time the
+    model reported; a response is only placed by when its events reached the
+    client. Arrival orders both, and printing both ends of each one shows where
+    the user and the model were speaking at the same time.
+    """
+
+    entries: dict[tuple[str, str], dict] = {}
+
+    def entry(side: str, key: str, at: float) -> dict:
+        return entries.setdefault((side, key), {"opened": at, "closed": at, "span": "", "deltas": [], "text": None})
+
+    for index, event in enumerate(events):
         kind = event.get("type")
+        at = arrivals[index]
+        item_id = str(event.get("item_id") or "")
+        response_id = str(event.get("response_id") or "")
         if kind == "input_audio_buffer.speech_started":
-            utterances[item_id] = {
-                "start_ms": event.get("audio_start_ms"),
-                "end_ms": None,
-                "deltas": [],
-                "transcript": None,
-            }
-        elif item_id in utterances:
-            if kind == "conversation.item.input_audio_transcription.delta":
-                utterances[item_id]["deltas"].append(str(event.get("delta") or ""))
-            elif kind == "input_audio_buffer.speech_stopped":
-                utterances[item_id]["end_ms"] = event.get("audio_end_ms")
-            elif kind == "conversation.item.input_audio_transcription.completed":
-                utterances[item_id]["transcript"] = str(event.get("transcript") or "")
-    return utterances
+            entry("user", item_id, at)["span"] = f"[{event.get('audio_start_ms')},"
+        elif kind == "conversation.item.input_audio_transcription.delta":
+            entry("user", item_id, at)["deltas"].append(str(event.get("delta") or ""))
+        elif kind == "input_audio_buffer.speech_stopped":
+            stopped = entry("user", item_id, at)
+            stopped["span"] += f"{event.get('audio_end_ms')}]ms"
+            stopped["closed"] = at
+        elif kind == "conversation.item.input_audio_transcription.completed":
+            transcribed = entry("user", item_id, at)
+            transcribed["text"] = str(event.get("transcript") or "")
+            transcribed["closed"] = at
+        elif kind == "response.created":
+            entry("turn", response_id, at)
+        elif kind == "response.output_audio_transcript.done":
+            entry("turn", response_id, at)["text"] = str(event.get("transcript") or "")
+        elif kind == "response.done":
+            entry("turn", response_id, at)["closed"] = at
+
+    lines: list[str] = []
+    for (side, key), record in sorted(entries.items(), key=lambda pair: pair[1]["opened"]):
+        when = f"{record['opened']:6.2f}s →{record['closed']:6.2f}s"
+        if side != "user":
+            lines.append(f"{when}  turn {key[-8:]:<14} {'':<16} {(record['text'] or '')!r}")
+            continue
+        deltas = "".join(record["deltas"])
+        text = deltas if record["text"] is None else record["text"]
+        # The deltas a client streamed must add up to the transcript it is then
+        # told the utterance was.
+        mismatch = "" if record["text"] in (None, deltas) else f"  (deltas={deltas!r})"
+        lines.append(f"{when}  user {key[:14]:<14} {record['span']:<16} {text!r}{mismatch}")
+    return lines
 
 
 def user_speech_order_violations(events: list[dict]) -> list[str]:
@@ -207,6 +235,9 @@ async def run(args: argparse.Namespace) -> int:
         instructions=args.instructions,
     )
     events: list[dict] = []
+    # When each event reached the client. The only clock the user side and the
+    # model side have in common, so it is what orders the timeline.
+    arrivals: list[float] = []
     started = time.monotonic()
 
     async with DuplexClient(
@@ -216,6 +247,7 @@ async def run(args: argparse.Namespace) -> int:
 
         async def collect() -> None:
             async for event in client.events():
+                arrivals.append(time.monotonic() - started)
                 events.append(event.raw)
                 if args.verbose:
                     print(f"    {time.monotonic() - started:7.2f}s {json.dumps(event.raw, ensure_ascii=False)}")
@@ -244,24 +276,15 @@ async def run(args: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             pass
 
-    transcripts = [
-        str(event.get("transcript") or "")
-        for event in events
-        if event.get("type") == "response.output_audio_transcript.done"
-    ]
     errors = [event for event in events if event.get("type") == "error"]
     print("\n--- summary ---")
     print(f"elapsed={time.monotonic() - started:.2f}s events={len(events)}")
     print(json.dumps(dict(sorted(Counter(str(event.get("type")) for event in events).items())), indent=2))
-    for item_id, utterance in user_utterances(events).items():
-        print(
-            f"user {item_id}: [{utterance['start_ms']}, {utterance['end_ms']}]ms "
-            f"deltas={''.join(utterance['deltas'])!r} completed={utterance['transcript']!r}"
-        )
+    print("\n--- timeline: opened → closed, seconds since connect ---")
+    for line in conversation_timeline(events, arrivals):
+        print(line)
     violations = user_speech_order_violations(events)
     print(f"user_speech_order={'ok' if not violations else violations}")
-    for turn, transcript in enumerate(transcripts):
-        print(f"turn {turn}: {transcript!r}")
     if errors:
         print(f"errors={json.dumps(errors, ensure_ascii=False)[:2000]}")
     if args.jsonl:
