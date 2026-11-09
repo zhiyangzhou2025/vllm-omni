@@ -23,6 +23,10 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS
 
+# Stands in for every text token when asking a window what its phase allows.
+# Any id outside the protocol set works; the window never reads its value.
+_TEXT_PROBE_TOKEN_ID = 0
+
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
     """Qwen3-Omni runtime with exact duplex audio windows on Stage 0."""
@@ -261,9 +265,12 @@ def _mask_illegal_logits(row_logits: torch.Tensor, window: object) -> None:
     present = [token_id for token_id in DUPLEX_TOKEN_IDS if token_id < vocab]
     values = {token_id: float(row_logits[token_id].item()) for token_id in present}
     # Text tokens are legal in the text phases and are not listed individually,
-    # so a phase that keeps them keeps every non-protocol logit as well.
+    # so ask about one of them instead: a phase that keeps text keeps the probe,
+    # and a phase that forces a protocol token drops it. Passing protocol tokens
+    # alone cannot tell the two apart, which masked text out of every phase.
+    values[_TEXT_PROBE_TOKEN_ID] = 0.0
     legal = set(window.constrain(values).keys())
-    if legal - set(present):
+    if _TEXT_PROBE_TOKEN_ID in legal:
         illegal = [token_id for token_id in present if token_id not in legal]
         if illegal:
             row_logits[illegal] = float("-inf")

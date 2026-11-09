@@ -64,6 +64,25 @@ def test_listen_forces_unit_end_before_the_window_closes() -> None:
     assert stage._stage0_windows.window_for("req").state.phase == "control"
 
 
+def test_text_phases_keep_text_and_drop_only_the_illegal_protocol_tokens() -> None:
+    stage = _Stage()
+    window = stage._stage0_windows.window_for("req")
+    window.observe(DUPLEX_TOKENS.speak)
+
+    logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
+    stage.prepare_duplex_sampling(logits, None, (_row("req"),))
+
+    # ``<|speak|>`` opens the text phase, so ordinary tokens stay drawable and
+    # only the protocol tokens the phase forbids are masked.
+    assert torch.isfinite(logits[0, 100])
+    assert torch.isfinite(logits[0, DUPLEX_TOKENS.unit_end])
+    assert torch.isfinite(logits[0, DUPLEX_TOKENS.turn_eos])
+    assert torch.isfinite(logits[0, DUPLEX_TOKENS.launch])
+    assert torch.isneginf(logits[0, DUPLEX_TOKENS.chunk_eos])
+    assert torch.isneginf(logits[0, DUPLEX_TOKENS.listen])
+    assert torch.isneginf(logits[0, DUPLEX_TOKENS.cancel])
+
+
 def test_turn_eos_forces_unit_end_before_the_window_closes() -> None:
     stage = _Stage()
     window = stage._stage0_windows.window_for("req")
