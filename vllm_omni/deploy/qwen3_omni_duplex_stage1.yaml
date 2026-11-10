@@ -15,5 +15,12 @@ stages:
     moe_backend: triton
     devices: "0"
     default_sampling_params:
+      # Greedy, so a replayed turn draws the same codec tokens every run. The
+      # native Talker deploy samples at 0.9 instead; this stage exists to be
+      # compared against a reference, not to sound natural.
       temperature: 0.0
-      max_tokens: 1
+      # One request is one turn, and a turn spends one decode step per codec
+      # frame. The duplex Talker branch is what ends it -- on the final window
+      # by codec_eos, on every earlier one by the window's frame budget. This
+      # is only the runaway backstop, matching the native Talker stage.
+      max_tokens: 4096
