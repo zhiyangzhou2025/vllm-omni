@@ -5,6 +5,14 @@
 Each pipeline is selected only by its deploy YAML. The checkpoint still reports
 the Qwen3-Omni-MoE architecture, so these entries must not participate in
 automatic model detection.
+
+Each pipeline here serves one module on its own, so its only stage sits at
+position 0 whichever module that is: the orchestrator indexes stage pools by
+``stage_id`` and rejects a topology whose ids are not zero-based and contiguous
+(``engine/stage_runtime.py`` ``_build_logical_stage_init_plans``). A deploy YAML
+may still name the module's own number under ``stages:`` -- that list selects
+which stage's settings to override -- but only when a ``base_config`` supplies a
+topology that reaches that number.
 """
 
 from typing import Any, Literal
@@ -29,7 +37,6 @@ _CODEC_EOS_TOKEN_ID = 2150
 
 def _stage(
     *,
-    stage_id: int,
     model_stage: str,
     execution_type: StageExecutionType,
     final_output_type: str,
@@ -42,7 +49,7 @@ def _stage(
     recompute_preemption: Literal["allow", "fail"] = "allow",
 ) -> StagePipelineConfig:
     return StagePipelineConfig(
-        stage_id=stage_id,
+        stage_id=0,
         model_stage=model_stage,
         execution_type=execution_type,
         input_sources=(),
@@ -64,7 +71,6 @@ QWEN3_OMNI_DUPLEX_THINKER_PIPELINE = PipelineConfig(
     duplex_plugin="vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin.Qwen3OmniDuplexPlugin",
     stages=(
         _stage(
-            stage_id=0,
             model_stage="thinker",
             execution_type=StageExecutionType.LLM_AR,
             final_output_type="text",
@@ -81,7 +87,6 @@ QWEN3_OMNI_DUPLEX_TALKER_PIPELINE = PipelineConfig(
     model_arch=_DUPLEX_ARCH,
     stages=(
         _stage(
-            stage_id=1,
             model_stage="talker",
             execution_type=StageExecutionType.LLM_AR,
             final_output_type="latent",
@@ -118,7 +123,6 @@ QWEN3_OMNI_DUPLEX_CODE2WAV_PIPELINE = PipelineConfig(
     model_arch=_ARCH,
     stages=(
         _stage(
-            stage_id=2,
             model_stage="code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             final_output_type="audio",

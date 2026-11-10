@@ -1,6 +1,9 @@
 # Independent Stage 1 API for Qwen3-Omni-Duplex.
 # The pipeline key forces the single-stage topology; this is not a distributed
 # --stage-id worker and does not inherit the three-stage Qwen3-Omni deployment.
+# The Talker is that topology's only stage, so it is stage 0 here whatever its
+# number in the eventual three-stage deployment: the orchestrator indexes stage
+# pools by stage_id and requires them zero-based and contiguous.
 pipeline: qwen3_omni_duplex_talker
 session_mode: duplex
 trust_remote_code: true
@@ -9,7 +12,7 @@ enforce_eager: true
 async_scheduling: false
 
 stages:
-  - stage_id: 1
+  - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.5
     moe_backend: triton
