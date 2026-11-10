@@ -14,13 +14,14 @@ stages:
     gpu_memory_utilization: 0.5
     moe_backend: triton
     devices: "0"
+    # The code predictor samples the 15 residual groups inside the model, where
+    # vLLM's sampler seeding never reaches. Greedy there too, so a replayed turn
+    # yields the same codes every run.
+    subtalker_sampling_params:
+      do_sample: false
     default_sampling_params:
-      # Greedy, so a replayed turn draws the same codec tokens every run. The
-      # native Talker deploy samples at 0.9 instead; this stage exists to be
-      # compared against a reference, not to sound natural.
+      # Greedy, so the layer-0 codec code is reproducible as well. The native
+      # Talker deploy samples at 0.9 instead; this stage exists to be compared
+      # against a reference, not to sound natural.
       temperature: 0.0
-      # One request is one turn, and a turn spends one decode step per codec
-      # frame. The duplex Talker branch is what ends it -- on the final window
-      # by codec_eos, on every earlier one by the window's frame budget. This
-      # is only the runaway backstop, matching the native Talker stage.
-      max_tokens: 4096
+      # max_tokens is the per-window frame budget and comes from the pipeline.

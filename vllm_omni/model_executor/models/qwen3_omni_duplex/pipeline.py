@@ -14,6 +14,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import AUDIO_TOKENS_PER_UNIT
 
 # Stage 2 reads codes out of the checkpoint's own Code2Wav module and needs
 # nothing the duplex protocol adds.
@@ -88,9 +89,18 @@ QWEN3_OMNI_DUPLEX_TALKER_PIPELINE = PipelineConfig(
             owns_tokenizer=False,
             requires_multimodal_data=False,
             hf_config_name="talker_config",
-            # Only the turn's final window may sample codec_eos; the Talker
-            # branch masks it out of every earlier one.
-            sampling_constraints={"stop_token_ids": [_CODEC_EOS_TOKEN_ID]},
+            sampling_constraints={
+                # Only the turn's final window may sample codec_eos; the Talker
+                # branch masks it out of every earlier one.
+                "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
+                # One window is worth this many codec frames, and one frame
+                # costs one decode step. Exhausting the budget does not end a
+                # resumable request -- the scheduler returns it to
+                # WAITING_FOR_STREAMING_REQ regardless of why it stopped -- so
+                # this makes the turn pause once per window and resume on the
+                # next one, the same mechanism Stage 0 uses per append.
+                "max_tokens": AUDIO_TOKENS_PER_UNIT,
+            },
             # The Talker conditions on the Thinker's projected hidden state, not
             # on the tokens alone, so it waits for the whole upstream payload.
             requires_full_payload_input=True,

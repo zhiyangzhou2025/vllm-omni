@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import CODEC_FRAMES_PER_WINDOW
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
     QWEN3_OMNI_DUPLEX_CODE2WAV_PIPELINE,
     QWEN3_OMNI_DUPLEX_TALKER_PIPELINE,
@@ -24,6 +25,14 @@ def test_the_talker_stops_on_codec_eos_and_keeps_its_codes_undetokenized() -> No
     assert stage.sampling_constraints["stop_token_ids"] == [CODEC_EOS_TOKEN_ID]
     # Codec ids are not text; detokenizing them yields whatever shares the id.
     assert stage.sampling_constraints["detokenize"] is False
+
+
+def test_the_talker_spends_one_decode_step_per_codec_frame() -> None:
+    (stage,) = QWEN3_OMNI_DUPLEX_TALKER_PIPELINE.stages
+
+    # A resumable turn is not ended by exhausting max_tokens, so the budget
+    # paces the turn one window at a time instead of capping it.
+    assert stage.sampling_constraints["max_tokens"] == CODEC_FRAMES_PER_WINDOW
 
 
 def test_a_preempted_talker_turn_fails_instead_of_replaying() -> None:
