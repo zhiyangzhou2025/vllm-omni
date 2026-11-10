@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stage 0 Thinker execution for Qwen3-Omni-Duplex."""
+"""Window-protocol execution for Qwen3-Omni-Duplex.
+
+The checkpoint's three stages share one model class, so this subclass serves
+every stage that speaks the duplex window protocol: the Thinker writes the
+window rows and constrains its own sampling to the protocol, and the Talker
+reads those rows back and is held to one window's worth of codec frames.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     Stage0Windows,
     ThinkerProtocolError,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import frame_budget
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS
 
 # Stands in for every text token when asking a window what its phase allows.
@@ -29,7 +36,7 @@ _TEXT_PROBE_TOKEN_ID = 0
 
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
-    """Qwen3-Omni runtime with exact duplex audio windows on Stage 0."""
+    """Qwen3-Omni runtime that holds both stages to the duplex window."""
 
     # The runner only calls prepare_duplex_sampling for models that opt in.
     prefer_model_sampler = True
@@ -147,7 +154,12 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         """
 
         del sampling_metadata
-        if self.model_stage != "thinker" or not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+        if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+            return
+        if self.model_stage == "talker":
+            self._mask_premature_codec_eos(logits, rows)
+            return
+        if self.model_stage != "thinker":
             return
         for row in rows:
             row_idx = getattr(row, "row_idx", -1)
@@ -158,16 +170,39 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
                 continue
             _mask_illegal_logits(logits[row_idx], window)
 
+    def _mask_premature_codec_eos(self, logits: torch.Tensor, rows: object) -> None:
+        """Deny ``codec_eos`` to every window that is not the turn's last.
+
+        ``codec_eos`` is the Talker stage's stop token, so drawing it ends the
+        turn. The protocol paces a turn one window at a time, and a window the
+        Thinker has already followed with more audio has no right to end it.
+        Only the last window of a turn may, which is what ``frame_budget``
+        answers; the flag itself travels on the window's own duplex payload.
+        """
+
+        codec_eos = int(self.talker_config.codec_eos_token_id)
+        if codec_eos >= int(logits.shape[1]):
+            return
+        for row in rows:
+            row_idx = getattr(row, "row_idx", -1)
+            if row_idx < 0 or row_idx >= logits.shape[0]:
+                continue
+            payload = getattr(row, "payload", None)
+            if not isinstance(payload, Mapping):
+                continue
+            if frame_budget(is_final_window=bool(payload.get("final_window"))).allow_codec_eos:
+                continue
+            logits[row_idx, codec_eos] = float("-inf")
+
     def sample(self, logits: torch.Tensor, sampling_metadata: object) -> object:
-        """Constrain, then let the runner's sampler draw the token.
+        """Constrain, then draw the token.
 
         The runner calls this only because ``prefer_model_sampler`` is set, and
         that flag exists so the runner invokes ``prepare_duplex_sampling`` before
         sampling. The constraint is already applied to ``logits`` by then. The
-        thinker has no sampler of its own: the parent forwards to the stage
-        module, which does not implement one. Returning ``None`` is the runner's
-        contract for declining the step, and it then samples with its own sampler
-        from the masked logits.
+        thinker stage module implements no sampler, so the draw falls to the
+        runner: returning ``None`` is its contract for declining the step, and
+        it then samples from the masked logits itself.
 
         ``_sample_with_parent`` stays so tests can substitute a deterministic
         draw. A substitute that returns tokens advances the window here, because
@@ -202,9 +237,13 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         return torch.full((len(req_ids), 1), -1, dtype=torch.long)
 
     def _sample_with_parent(self, logits: torch.Tensor, sampling_metadata: object) -> object:
-        # The runner samples from the masked logits when this returns None.
-        del logits, sampling_metadata
-        return None
+        if self.model_stage == "thinker":
+            # The runner samples from the masked logits when this returns None.
+            return None
+        # Every other stage module does own a sampler, and the parent forwards
+        # to it. Declining the step there would leave the Talker's codes to the
+        # runner's own sampler, which never sees the code predictor.
+        return super().sample(logits, sampling_metadata)
 
     def _advance_windows(self, sampled: object, request_ids: object) -> None:
         """Move each window to the phase its sampled token produces.
