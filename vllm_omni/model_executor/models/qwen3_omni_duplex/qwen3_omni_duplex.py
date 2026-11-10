@@ -27,7 +27,11 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     Stage0Windows,
     ThinkerProtocolError,
 )
-from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import frame_budget
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import (
+    BOOTSTRAP_ROWS,
+    audio_row_mask,
+    frame_budget,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKEN_IDS
 
 # Stands in for every text token when asking a window what its phase allows.
@@ -144,6 +148,126 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         if len(encoded) != 1:
             raise ValueError("Qwen3-Omni-Duplex audio window must encode as one item")
         return encoded[0]
+
+    def _thinker_to_talker_prefill(
+        self,
+        thinker_embed: torch.Tensor,
+        thinker_hidden: torch.Tensor,
+        multimodal_mask: torch.Tensor | None,
+        input_ids: torch.Tensor,
+        thinker_result_ids: torch.Tensor,
+        speaker_id: object,
+        tts_bos_thinker: torch.Tensor | None = None,
+        tts_eos_thinker: torch.Tensor | None = None,
+        tts_pad_thinker: torch.Tensor | None = None,
+        input_ids_cpu: torch.Tensor | None = None,
+        thinker_result_ids_cpu: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Turn one window run into the Talker's prefill rows.
+
+        The Thinker's prompt is the context, so the whole of it projects as one
+        span. The parent instead splits the prompt on ``<|im_start|>``, drops the
+        system segment and keeps only the last assistant one, because a turn-based
+        prompt is a ChatML transcript. A window run is not: it is
+        ``prefix, window_0, unit_end, window_1, ...`` with no role headers after
+        the prefix, so a split on ``<|im_start|>`` would hand the Talker the
+        prefix alone and throw every window away.
+
+        Which rows carry acoustic content comes from the window layout rather
+        than from ``audio_token_id``, which the parent keys on and a duplex
+        window never contains.
+
+        The Thinker's generated text becomes the turn's text steps: the first of
+        them opens the bootstrap rows and the rest queue up for decode. Protocol
+        tokens are dropped from that queue -- they pace the window, they are not
+        speech. ``<|tts_eos|>`` is not appended here either: a non-final window
+        would then end the turn's text early, so the final window's EOS is left
+        to the decode path, which emits it once the queue runs dry.
+        """
+
+        del multimodal_mask  # The parent overwrites this parameter unconditionally.
+        prompt_ids = (input_ids_cpu if input_ids_cpu is not None else input_ids).reshape(-1)
+        all_ids = (thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids).reshape(-1)
+
+        tts_bos_embed, _tts_eos_embed, tts_pad_embed = self._get_tts_embed(
+            thinker_embed, tts_bos_thinker, tts_eos_thinker, tts_pad_thinker
+        )
+        context = self._get_talker_user_parts(
+            0,
+            int(prompt_ids.shape[0]),
+            audio_row_mask(prompt_ids),
+            thinker_hidden,
+            thinker_embed,
+        )
+        # _get_talker_user_parts clamps the span to the rows it was actually
+        # given, so its own answer is the one the ids have to match.
+        context_rows = int(context.shape[0])
+        text_queue = self._duplex_text_queue(all_ids[context_rows:], thinker_embed[context_rows:])
+        bootstrap_ids, bootstrap = self._duplex_bootstrap(speaker_id, text_queue, tts_bos_embed, tts_pad_embed)
+
+        talker_embeds = torch.cat([context.to(bootstrap.device, bootstrap.dtype), bootstrap], dim=0)
+        talker_ids = torch.cat(
+            [thinker_result_ids.reshape(-1)[:context_rows].to(bootstrap_ids.device), bootstrap_ids],
+            dim=0,
+        )
+        # The bootstrap already spent the first entry; decode consumes the rest.
+        trailing = text_queue[1:] if int(text_queue.shape[0]) > 1 else None
+        return talker_ids, talker_embeds, trailing
+
+    def _duplex_text_queue(self, generated_ids: torch.Tensor, generated_embed: torch.Tensor) -> torch.Tensor:
+        """Project the Thinker's spoken rows, in order, into Talker text space."""
+
+        ids = generated_ids.reshape(-1)
+        rows = min(int(ids.shape[0]), int(generated_embed.shape[0]))
+        ids = ids[:rows]
+        protocol = torch.tensor(sorted(DUPLEX_TOKEN_IDS), dtype=ids.dtype, device=ids.device)
+        spoken = torch.nonzero(~torch.isin(ids, protocol)).flatten()
+        selected = generated_embed[:rows].index_select(0, spoken.to(generated_embed.device))
+        return self.talker.text_projection(selected)
+
+    def _duplex_bootstrap(
+        self,
+        speaker_id: object,
+        text_queue: torch.Tensor,
+        tts_bos_embed: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the rows a turn opens with: text channel plus codec channel.
+
+        The parent spends nine rows here because it keeps the three
+        ``<|im_start|>assistant\\n`` rows it split the prompt on. A window run has
+        no such header, so only the six the codec channel needs are left.
+        """
+
+        codec_ids = torch.tensor(
+            [
+                self.talker_config.codec_nothink_id,
+                self.talker_config.codec_think_bos_id,
+                self.talker_config.codec_think_eos_id,
+                speaker_id,
+                self.talker_config.codec_pad_id,
+                self.talker_config.codec_bos_id,
+            ],
+            dtype=torch.long,
+            device=tts_pad_embed.device,
+        )
+        codec = self.talker.embed_input_ids(codec_ids).to(device=tts_pad_embed.device, dtype=tts_pad_embed.dtype)
+        first_text = text_queue[:1] if int(text_queue.shape[0]) else torch.zeros_like(tts_bos_embed)
+        text = torch.cat(
+            [
+                tts_pad_embed.expand(BOOTSTRAP_ROWS - 2, -1),
+                tts_bos_embed,
+                first_text.to(tts_bos_embed.device, tts_bos_embed.dtype),
+            ],
+            dim=0,
+        )
+        ids = torch.full(
+            (BOOTSTRAP_ROWS,),
+            fill_value=self.config.tts_pad_token_id,
+            dtype=torch.long,
+            device=codec.device,
+        )
+        return ids, text.to(codec.dtype) + codec
 
     def prepare_duplex_sampling(self, logits: torch.Tensor, sampling_metadata: object, rows: object) -> None:
         """Mask every logit the current window phase does not allow.

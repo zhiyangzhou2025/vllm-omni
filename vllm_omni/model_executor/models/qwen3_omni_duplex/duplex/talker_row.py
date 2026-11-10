@@ -40,6 +40,12 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKE
 AUDIO_ROW_OFFSETS = tuple(range(UNIT_START_TOKENS + 1, UNIT_START_TOKENS + 1 + AUDIO_TOKENS_PER_UNIT))
 # One 0.48-second window is worth this many codec frames at 12.5 Hz.
 CODEC_FRAMES_PER_WINDOW = AUDIO_TOKENS_PER_UNIT
+# ``[tts_pad, tts_pad, tts_pad, tts_pad, tts_bos, first_text]`` summed with six
+# codec special rows, and the whole of what a turn adds to the context rows. The
+# non-duplex Talker spends nine rows here: it splits the Thinker prompt into
+# ChatML segments and keeps the three ``<|im_start|>assistant\n`` rows it split
+# on. A window run has no such header to keep.
+BOOTSTRAP_ROWS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,7 @@ def frame_budget(*, is_final_window: bool) -> FrameBudget:
 
 __all__ = [
     "AUDIO_ROW_OFFSETS",
+    "BOOTSTRAP_ROWS",
     "CODEC_FRAMES_PER_WINDOW",
     "FrameBudget",
     "audio_row_mask",
