@@ -79,12 +79,14 @@ def test_the_talker_never_runs_the_thinker_window_constraint() -> None:
     assert bool(torch.isfinite(logits).all())
 
 
-def test_the_talker_keeps_its_own_sampler() -> None:
+def test_the_talker_leaves_the_draw_to_the_runner() -> None:
     stage = _Talker()
-    drawn = SimpleNamespace(sampled_token_ids=torch.tensor([[7]]))
-    stage.model = SimpleNamespace(sample=lambda logits, sampling_metadata: drawn)
+    # The stage module the parent would forward to. The real one is
+    # Qwen3OmniMoeTalkerForConditionalGeneration, which implements no sampler,
+    # so forwarding raises instead of drawing.
+    stage.model = SimpleNamespace()
 
-    # prefer_model_sampler is set for the Thinker's benefit, and the Thinker
-    # declines the draw. Declining here would hand the codec codes to the
-    # runner's sampler, which never sees the code predictor.
-    assert stage.sample(torch.full((1, VOCAB), 5.0), None) is drawn
+    # prefer_model_sampler is set so the runner calls prepare_duplex_sampling,
+    # not because this stage draws. None is the runner's contract for declining,
+    # and it then samples the layer-0 codec id from the masked logits itself.
+    assert stage.sample(torch.full((1, VOCAB), 5.0), None) is None

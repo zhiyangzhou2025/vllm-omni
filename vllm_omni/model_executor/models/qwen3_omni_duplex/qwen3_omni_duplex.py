@@ -10,7 +10,7 @@ reads those rows back and is held to one window's worth of codec frames.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import torch
@@ -37,6 +37,10 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKE
 # Stands in for every text token when asking a window what its phase allows.
 # Any id outside the protocol set works; the window never reads its value.
 _TEXT_PROBE_TOKEN_ID = 0
+# The Talker's code predictor packs the checkpoint's separate q/k/v and gate/up
+# tensors into fused projections, buffering the shards for the length of one
+# call. Its subtree under the checkpoint's own naming.
+_CODE_PREDICTOR_PREFIX = "talker.code_predictor."
 
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
@@ -73,6 +77,21 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         # it answers with placeholder rows. On the talker stage the runner would
         # merge those over the codec codes talker_mtp just produced.
         self.post_sample_talker_mtp = None
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Stream the checkpoint with the code predictor's subtree kept whole.
+
+        The code predictor's loader buffers the checkpoint's separate q/k/v and
+        gate/up tensors and fuses them at the end of the call that delivered
+        them, refusing to return while a fused projection is still incomplete.
+        It therefore has to see its whole subtree in one call, and vLLM's weight
+        loader gives a child one call per *adjacent* run of the stream while the
+        stream itself arrives one shard file at a time rather than in the
+        index's order. This checkpoint splits the subtree across two shard
+        files, cutting layer 3 between its q/k/v and its gate/up shards, so the
+        order it arrives in has to be repaired before the parent routes it.
+        """
+        return super().load_weights(_code_predictor_last(weights))
 
     def thinker_preprocess(
         self,
@@ -323,10 +342,10 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
 
         The runner calls this only because ``prefer_model_sampler`` is set, and
         that flag exists so the runner invokes ``prepare_duplex_sampling`` before
-        sampling. The constraint is already applied to ``logits`` by then. The
-        thinker stage module implements no sampler, so the draw falls to the
-        runner: returning ``None`` is its contract for declining the step, and
-        it then samples from the masked logits itself.
+        sampling. The constraint is already applied to ``logits`` by then, and
+        the draw itself falls back to the runner: returning ``None`` is its
+        contract for declining the step, and it then samples from the masked
+        logits itself.
 
         ``_sample_with_parent`` stays so tests can substitute a deterministic
         draw. A substitute that returns tokens advances the window here, because
@@ -361,13 +380,14 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         return torch.full((len(req_ids), 1), -1, dtype=torch.long)
 
     def _sample_with_parent(self, logits: torch.Tensor, sampling_metadata: object) -> object:
-        if self.model_stage == "thinker":
-            # The runner samples from the masked logits when this returns None.
-            return None
-        # Every other stage module does own a sampler, and the parent forwards
-        # to it. Declining the step there would leave the Talker's codes to the
-        # runner's own sampler, which never sees the code predictor.
-        return super().sample(logits, sampling_metadata)
+        del logits, sampling_metadata
+        # The parent forwards the draw to the stage module, and neither stage
+        # this class serves implements one: the thinker module has no sampler
+        # at all, and the talker's layer-0 codec id comes from the runner's
+        # sampler exactly as it does in turn-based serving, where this hook is
+        # never reached. The 15 residual groups are not drawn here either;
+        # talker_mtp runs the code predictor over the drawn layer-0 id.
+        return None
 
     def _advance_windows(self, sampled: object, request_ids: object) -> None:
         """Move each window to the phase its sampled token produces.
@@ -408,6 +428,19 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             extractor = cached_processor_from_config(self.vllm_config.model_config).feature_extractor
             self._qwen3_omni_duplex_feature_extractor = extractor
         return extractor
+
+
+def _code_predictor_last(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Move the code predictor's subtree to the end as one uninterrupted run."""
+    held: list[tuple[str, torch.Tensor]] = []
+    for name, weight in weights:
+        if name.startswith(_CODE_PREDICTOR_PREFIX):
+            held.append((name, weight))
+            continue
+        yield name, weight
+    yield from held
 
 
 def _optional_int(primary: object, fallback: object) -> int | None:
