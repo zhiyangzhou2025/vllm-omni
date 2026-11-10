@@ -120,3 +120,18 @@ def test_turn_eos_forces_unit_end_before_the_window_closes() -> None:
 
     assert int(sampled.sampled_token_ids[0, 0]) == DUPLEX_TOKENS.unit_end
     assert stage._stage0_windows.window_for("req").state.phase == "control"
+
+
+def test_the_stage_0_hook_is_hidden_from_the_talker_stage() -> None:
+    class _Talker(Qwen3OmniDuplexForConditionalGeneration):
+        def __init__(self) -> None:
+            self.model_stage = "talker"
+
+    stage = _Talker()
+    # The runner enables this path for any callable attribute, and the Stage 0
+    # implementation answers with placeholder rows instead of codec codes.
+    assert callable(stage.post_sample_talker_mtp)
+
+    stage._wire_stage_hooks()
+
+    assert stage.post_sample_talker_mtp is None

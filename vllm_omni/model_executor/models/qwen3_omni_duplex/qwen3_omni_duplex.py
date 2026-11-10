@@ -36,17 +36,32 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # The parent exposes talker_mtp for every stage, and the runner enables
-        # its MTP path whenever the attribute is a method. Stage 0 is the
-        # thinker: it has no talker, and that path would demand mtp_inputs the
-        # thinker preprocess never produces.
+        self._wire_stage_hooks()
+
+    def _wire_stage_hooks(self) -> None:
+        """Expose only the hooks that belong to the stage being served.
+
+        One class serves every stage of the checkpoint, and the runner enables
+        each optional path by testing whether its attribute is callable. A hook
+        left visible on the wrong stage is therefore silently taken for that
+        stage's implementation.
+        """
+
         if self.model_stage == "thinker":
             # Reading the manifest here rejects a pre-v3 checkpoint at startup
             # rather than once per session.
             self._stage0_windows = Stage0Windows(read_user_signal(self.vllm_config.model_config.model))
+            # The parent exposes talker_mtp for every stage. Stage 0 is the
+            # thinker: it has no talker, and that path would demand mtp_inputs
+            # the thinker preprocess never produces.
             self.talker_mtp = None
             self.has_preprocess = True
             self.set_custom_preprocess(self.thinker_preprocess)
+            return
+        # post_sample_talker_mtp below is the thinker's window bookkeeping, and
+        # it answers with placeholder rows. On the talker stage the runner would
+        # merge those over the codec codes talker_mtp just produced.
+        self.post_sample_talker_mtp = None
 
     def thinker_preprocess(
         self,
