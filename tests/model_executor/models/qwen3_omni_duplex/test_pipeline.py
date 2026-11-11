@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -9,24 +8,18 @@ import yaml
 
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import CODEC_FRAMES_PER_WINDOW
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
-    QWEN3_OMNI_DUPLEX_CODE2WAV_PIPELINE,
     QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
-    QWEN3_OMNI_DUPLEX_TALKER_PIPELINE,
     QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
 )
 
 CODEC_EOS_TOKEN_ID = 2150
 PIPELINES = {
     "qwen3_omni_duplex_stage0.yaml": QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
-    "qwen3_omni_duplex_stage1.yaml": QWEN3_OMNI_DUPLEX_TALKER_PIPELINE,
-    "qwen3_omni_duplex_stage2.yaml": QWEN3_OMNI_DUPLEX_CODE2WAV_PIPELINE,
     "qwen3_omni_duplex_stage12.yaml": QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
 }
 DEPLOY_DIR = Path(__file__).parents[4] / "vllm_omni" / "deploy"
-# The Talker is served through the Talker+Code2Wav pair, so its own settings are
-# asserted on the stage that topology carries. One factory builds the Talker
-# stage for both topologies; ``test_the_two_talker_stages_differ_only_in_the_handoff``
-# is what keeps that true.
+# The Talker is served only through the Talker+Code2Wav pair, so its own
+# settings are asserted on the stage that topology carries.
 TALKER_STAGE = QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE.stages[0]
 
 
@@ -48,10 +41,11 @@ def test_each_debugging_topology_numbers_its_stages_from_zero(name: str) -> None
 
 def test_both_window_protocol_stages_are_served_by_the_duplex_class() -> None:
     # The Thinker writes the window rows and the Talker reads them back, so one
-    # class carries both halves of the protocol. Code2Wav only sees codes.
+    # class carries both halves of the protocol. The Talker takes no per-stage
+    # override, so it is served by its pipeline's class.
     assert QWEN3_OMNI_DUPLEX_THINKER_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"
-    assert QWEN3_OMNI_DUPLEX_TALKER_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"
-    assert QWEN3_OMNI_DUPLEX_CODE2WAV_PIPELINE.model_arch == "Qwen3OmniMoeForConditionalGeneration"
+    assert QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"
+    assert TALKER_STAGE.model_arch is None
 
 
 def test_the_talker_stops_on_codec_eos_and_keeps_its_codes_undetokenized() -> None:
@@ -95,16 +89,6 @@ def test_the_talker_hands_its_codes_down_instead_of_returning_them() -> None:
     # overrides the pipeline-wide duplex class back to the official one.
     assert QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"
     assert code2wav.model_arch == "Qwen3OmniMoeForConditionalGeneration"
-
-
-def test_the_two_talker_stages_differ_only_in_the_handoff() -> None:
-    (alone,) = QWEN3_OMNI_DUPLEX_TALKER_PIPELINE.stages
-
-    differing = {"final_output", "final_output_type", "custom_process_next_stage_input_func"}
-    for field in fields(TALKER_STAGE):
-        if field.name in differing:
-            continue
-        assert getattr(alone, field.name) == getattr(TALKER_STAGE, field.name), field.name
 
 
 def test_the_thinker_stage_keeps_its_own_settings() -> None:
