@@ -13,17 +13,16 @@ from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_dep
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _STAGES = (
-    ("qwen3_omni_duplex_stage0.yaml", "qwen3_omni_duplex_thinker", 0, "thinker", "text", "Qwen3OmniDuplexForConditionalGeneration"),
-    ("qwen3_omni_duplex_stage1.yaml", "qwen3_omni_duplex_talker", 1, "talker", "latent", "Qwen3OmniMoeForConditionalGeneration"),
-    ("qwen3_omni_duplex_stage2.yaml", "qwen3_omni_duplex_code2wav", 2, "code2wav", "audio", "Qwen3OmniMoeForConditionalGeneration"),
+    ("qwen3_omni_duplex_stage0.yaml", "qwen3_omni_duplex_thinker", "thinker", "text", "Qwen3OmniDuplexForConditionalGeneration"),
+    ("qwen3_omni_duplex_stage1.yaml", "qwen3_omni_duplex_talker", "talker", "latent", "Qwen3OmniDuplexForConditionalGeneration"),
+    ("qwen3_omni_duplex_stage2.yaml", "qwen3_omni_duplex_code2wav", "code2wav", "audio", "Qwen3OmniMoeForConditionalGeneration"),
 )
 
 
-@pytest.mark.parametrize(("deploy_name", "pipeline_name", "stage_id", "model_stage", "output_type", "model_arch"), _STAGES)
+@pytest.mark.parametrize(("deploy_name", "pipeline_name", "model_stage", "output_type", "model_arch"), _STAGES)
 def test_independent_stage_deploy_resolves_one_stage(
     deploy_name: str,
     pipeline_name: str,
-    stage_id: int,
     model_stage: str,
     output_type: str,
     model_arch: str,
@@ -42,7 +41,9 @@ def test_independent_stage_deploy_resolves_one_stage(
     assert pipeline.model_type == pipeline_name
     assert deploy.pipeline == pipeline_name
     assert deploy.session_mode == "duplex"
-    assert [stage.stage_id for stage in stages] == [stage_id]
+    # Each topology serves one module alone, so that module is stage 0 whatever
+    # its number in the eventual three-stage deployment.
+    assert [stage.stage_id for stage in stages] == [0]
     assert stages[0].model_stage == model_stage
     assert stages[0].final_output is True
     assert stages[0].final_output_type == output_type
