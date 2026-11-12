@@ -61,3 +61,9 @@ def test_talker_code2wav_deploy_resolves_the_pair() -> None:
     assert stages[1].final_output_type == "audio"
     assert stages[0].yaml_engine_args["model_arch"] == "Qwen3OmniDuplexForConditionalGeneration"
     assert stages[1].yaml_engine_args["model_arch"] == "Qwen3OmniMoeForConditionalGeneration"
+    # Codes stream down one frame per step, which keeps the prefill's all-zero
+    # rows out of Code2Wav.
+    assert [stage.yaml_engine_args["async_chunk"] for stage in stages] == [True, True]
+    assert stages[0].yaml_engine_args["custom_process_next_stage_input_func"] == (
+        "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+    )

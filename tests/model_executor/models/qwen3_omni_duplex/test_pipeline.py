@@ -80,11 +80,14 @@ def test_the_talker_hands_its_codes_down_instead_of_returning_them() -> None:
     assert code2wav.input_sources == (talker.stage_id,)
     assert code2wav.final_output is True
     assert code2wav.final_output_type == "audio"
-    # Whole-turn handoff: the async-chunk edge is deliberately not declared.
+    # The deploy streams codes down the async-chunk edge; the whole-turn edge
+    # stays declared for a deploy that turns async_chunk off.
+    assert talker.async_chunk_process_next_stage_input_func == (
+        "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+    )
     assert talker.custom_process_next_stage_input_func == (
         "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_full_payload"
     )
-    assert talker.async_chunk_process_next_stage_input_func is None
     # Code2Wav needs nothing the duplex protocol adds, so this one stage
     # overrides the pipeline-wide duplex class back to the official one.
     assert QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"

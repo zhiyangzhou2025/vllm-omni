@@ -11,14 +11,15 @@
 # zero last_talker_hidden. This is the smallest topology that keeps the handoff.
 #
 # Top-level keys outside DeployConfig are dropped, so enforce_eager and
-# async_scheduling are set per stage. async_chunk is a DeployConfig field and
-# stays off, so the whole turn's codes reach Code2Wav through
-# talker2code2wav_full_payload rather than in streamed 25-frame chunks.
+# async_scheduling are set per stage. async_chunk is a DeployConfig field: on,
+# the Talker's codes reach Code2Wav through talker2code2wav_async_chunk, one
+# frame cached per decode step, and the prefill's all-zero rows are left out.
+# The whole-turn edge would hand Code2Wav one of those rows as its first frame.
 pipeline: qwen3_omni_duplex_talker_code2wav
 session_mode: duplex
 trust_remote_code: true
 enable_prefix_caching: false
-async_chunk: false
+async_chunk: true
 
 stages:
   - stage_id: 0

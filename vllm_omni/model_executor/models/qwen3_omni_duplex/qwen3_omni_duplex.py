@@ -288,6 +288,45 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         )
         return ids, text.to(codec.dtype) + codec
 
+    def talker_preprocess_decode(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        update_dict: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Take each decode step's text from the queue the prefill built.
+
+        The parent switches on ``async_chunk``: with it set, it reads the text
+        from the upstream Thinker's live decode stream instead of
+        ``hidden_states.trailing_text``. In a deployment that flag also selects
+        the streamed Talker -> Code2Wav edge, which this topology uses. The duplex
+        Talker heads its topology, so no live stream ever arrives, and the
+        parent's fallback would hand the code predictor one EOS and then pad,
+        dropping the Thinker's text. The window's whole text is already in the
+        prefill's queue (``_thinker_to_talker_prefill``), so the queue is read
+        whatever the flag says.
+        """
+
+        device, dtype = input_embeds.device, input_embeds.dtype
+        pad = self.tts_pad_embed.to(device, dtype=dtype)
+        hs = payload.get("hidden_states", {})
+        queue = hs.get("trailing_text")
+        if isinstance(queue, torch.Tensor) and queue.numel() > 0:
+            text_step = queue[0:1, :].to(device, dtype=dtype)
+            rest = queue[1:, :].detach() if queue.shape[0] > 1 else pad
+            update_dict.setdefault("hidden_states", {})["trailing_text"] = rest
+        else:
+            text_step = pad
+
+        last = hs.get("last")
+        hidden_size = self.talker_config.text_config.hidden_size
+        if last is None:
+            last_talker_hidden = torch.zeros((1, hidden_size), device=device, dtype=dtype)
+        else:
+            last_talker_hidden = last.to(device, dtype=dtype).reshape(*last.shape[-2:])
+        return last_talker_hidden, text_step, update_dict
+
     def prepare_duplex_sampling(self, logits: torch.Tensor, sampling_metadata: object, rows: object) -> None:
         """Mask every logit the current window phase does not allow.
 

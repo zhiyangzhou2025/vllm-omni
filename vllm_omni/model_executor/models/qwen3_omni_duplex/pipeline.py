@@ -58,6 +58,7 @@ def _stage(
     model_arch: str | None = None,
     sampling_constraints: dict[str, Any] | None = None,
     custom_process_next_stage_input_func: str | None = None,
+    async_chunk_process_next_stage_input_func: str | None = None,
     requires_full_payload_input: bool = False,
     recompute_preemption: Literal["allow", "fail"] = "allow",
 ) -> StagePipelineConfig:
@@ -77,6 +78,7 @@ def _stage(
         model_arch=model_arch,
         sampling_constraints={"detokenize": owns_tokenizer, **(sampling_constraints or {})},
         custom_process_next_stage_input_func=custom_process_next_stage_input_func,
+        async_chunk_process_next_stage_input_func=async_chunk_process_next_stage_input_func,
         requires_full_payload_input=requires_full_payload_input,
         recompute_preemption=recompute_preemption,
     )
@@ -130,12 +132,14 @@ QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE = PipelineConfig(
                 # next one, the same mechanism Stage 0 uses per append.
                 "max_tokens": AUDIO_TOKENS_PER_UNIT,
             },
-            # Whole-turn handoff only. The official topology also declares
-            # ``talker2code2wav_async_chunk`` for streamed 25-frame chunks; that
-            # edge reads ``meta.codec_frame_valid`` / ``meta.first_audio``,
-            # which the duplex window protocol has not been shown to emit, so it
-            # is left unwired rather than declared untested.
+            # The deploy runs the streamed edge (``async_chunk: true``). It
+            # caches a frame per decode step from the row itself, so the
+            # prefill's all-zero rows never reach Code2Wav. The whole-turn
+            # handoff pairs rows with tokens one step off and hands Code2Wav a
+            # zero frame first; it stays declared as the official topology does,
+            # for a deploy that turns ``async_chunk`` off.
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             # The Talker conditions on the Thinker's projected hidden state, not
             # on the tokens alone, so it waits for the whole upstream payload.
             requires_full_payload_input=True,
