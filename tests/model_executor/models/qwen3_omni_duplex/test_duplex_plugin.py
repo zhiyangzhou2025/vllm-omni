@@ -13,6 +13,7 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin, validate_duplex_plugin_sampling
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin import (
+    DEFAULT_INSTRUCTIONS,
     INPUT_SAMPLE_RATE_HZ,
     WINDOW_STOP_TOKEN_IDS,
     Qwen3OmniDuplexPlugin,
@@ -180,11 +181,15 @@ def test_text_only_speak_turn_is_not_forwarded_and_stays_locked() -> None:
     assert first is not None and first.metadata["duplex_native_decision"] == "speak"
     assert second is not None and second.metadata["duplex_native_decision"] == "speak"
     assert plugin._speak_turn_modalities == ("text",)
-    with pytest.raises(Exception, match="modalities cannot be changed"):
-        plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["text", "audio"]), {"instructions": None})
-    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["text"]), {"instructions": None}) == {
-        "instructions": None
-    }
+    # A different set is dropped. The same set in another order is kept.
+    changed = DuplexSessionConfig(modalities=["text", "audio"], temperature=0.2)
+    assert plugin.runtime_config_for_update(changed, {"instructions": None})["instructions"] == DEFAULT_INSTRUCTIONS
+    assert changed.modalities == ["text"]
+    assert changed.temperature == 0.2
+    reordered = DuplexSessionConfig(modalities=["audio", "text"])
+    plugin._speak_turn_modalities = ("text", "audio")
+    plugin.runtime_config_for_update(reordered, {"instructions": DEFAULT_INSTRUCTIONS})
+    assert reordered.modalities == ["audio", "text"]
 
 
 def test_speak_turn_lock_clears_on_turn_eos_and_the_next_turn_can_enable_audio() -> None:
@@ -195,9 +200,9 @@ def test_speak_turn_lock_clears_on_turn_eos_and_the_next_turn_can_enable_audio()
     closed = _decide(plugin, ending, modalities=("text",))
     assert closed is not None
     assert plugin._speak_turn_modalities is None
-    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["audio"]), {"instructions": None}) == {
-        "instructions": None
-    }
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["audio"]), {"instructions": None})[
+        "instructions"
+    ] == DEFAULT_INSTRUCTIONS
     forwarded = _decide(plugin, nxt, modalities=("text", "audio"))
     assert forwarded is None
     assert plugin._speak_turn_modalities == ("text", "audio")
@@ -250,20 +255,43 @@ async def test_runtime_config_encodes_instructions(monkeypatch: pytest.MonkeyPat
 
     assert config["instructions"] == "Answer briefly."
     assert config["system_prefix_token_ids"] == [7, 8, 9]
+    omitted = DuplexSessionConfig()
+    omitted_runtime = await plugin.prepare_runtime_config(omitted, model_config=object())
+    assert omitted.instructions == DEFAULT_INSTRUCTIONS
+    assert omitted_runtime["instructions"] == DEFAULT_INSTRUCTIONS
     plan = _plan(plugin, _pcm(INPUT_SAMPLES_PER_UNIT), prefix=tuple(config["system_prefix_token_ids"]))
     assert plan.prompt["prompt_token_ids"][:3] == [7, 8, 9]
 
 
 @pytest.mark.asyncio
-async def test_runtime_config_rejects_reference_audio_and_a_changed_prompt() -> None:
+async def test_runtime_config_rejects_reference_audio_and_keeps_a_locked_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    monkeypatch.setattr(plugin, "_encode_system_prefix", lambda model_config, instructions: (1, 2, 3))
 
     with pytest.raises(Exception, match="reference audio"):
         await plugin.prepare_runtime_config(DuplexSessionConfig(ref_audio="clip.wav"), model_config=None)
-    with pytest.raises(Exception, match="instructions cannot be changed"):
-        plugin.runtime_config_for_update(
-            DuplexSessionConfig(instructions="new"), {"instructions": "Streaming Omni Conversation."}
-        )
+
+    # Before the prefix is submitted, a real change is re-encoded.
+    pending = DuplexSessionConfig(instructions="new", modalities=["text"])
+    reencoded = plugin.runtime_config_for_update(pending, {"instructions": DEFAULT_INSTRUCTIONS})
+    assert pending.instructions == "new"
+    assert reencoded["instructions"] == "new"
+    assert reencoded["system_prefix_token_ids"] == [1, 2, 3]
+
+    # After it is in the KV cache, the new sentence is dropped and modalities stay.
+    plugin._submitted_prefix["req"] = (1, 2, 3)
+    locked = DuplexSessionConfig(instructions="newer", modalities=["text"])
+    kept = plugin.runtime_config_for_update(locked, {"instructions": "new", "system_prefix_token_ids": [1, 2, 3]})
+    assert locked.instructions == "new"
+    assert locked.modalities == ["text"]
+    assert kept["instructions"] == "new"
+    assert kept["system_prefix_token_ids"] == [1, 2, 3]
+
+    # Resending the sentence in use, or omitting it, is not a change.
+    echo = DuplexSessionConfig(instructions=None, modalities=["audio"])
+    plugin.runtime_config_for_update(echo, {"instructions": "new"})
+    assert echo.instructions == "new"
+    assert echo.modalities == ["audio"]
 
 
 def test_later_appends_reserve_the_unit_end_slot() -> None:

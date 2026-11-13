@@ -567,6 +567,15 @@ class DuplexModelPlugin(ABC):
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
     ) -> dict[str, object]: ...
 
+    def drops_locked_instruction_updates(self) -> bool:
+        """After the context is locked, drop an instructions change instead of rejecting the update.
+
+        Default models reject the whole ``session.update``. A model that returns
+        True keeps the sentence already in the KV cache and still adopts the
+        other fields.
+        """
+        return False
+
     @abstractmethod
     def runtime_config_for_update(
         self,

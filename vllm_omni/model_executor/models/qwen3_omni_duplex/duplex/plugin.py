@@ -53,6 +53,17 @@ def _modalities(values: object) -> tuple[str, ...]:
     return tuple(str(item).lower() for item in values)
 
 
+def _modality_set(values: object) -> frozenset[str]:
+    return frozenset(_modalities(values))
+
+
+def _effective_instructions(value: object) -> str:
+    # An omitted field, null, and an empty string all mean the default sentence.
+    if isinstance(value, str) and value:
+        return value
+    return DEFAULT_INSTRUCTIONS
+
+
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     """Serve Stage 0 as one resumable request of exact audio windows."""
 
@@ -76,6 +87,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # change while the turn's later windows are still being generated, so
         # those windows read this snapshot rather than the attribute below.
         self._speak_turn_modalities: tuple[str, ...] | None = None
+        # Kept so a session update before the first window can re-encode the prefix.
+        self._instructions_model_config: object | None = None
 
     def configure_pipeline(self, pipeline_config: object) -> None:
         stages = getattr(pipeline_config, "stages", ()) or ()
@@ -240,34 +253,55 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.validate_client_extra_body(config.extra_body)
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 does not take reference audio")
-        instructions = config.instructions if isinstance(config.instructions, str) else ""
-        prefix = self._encode_system_prefix(model_config, instructions or DEFAULT_INSTRUCTIONS)
+        # Record the sentence actually encoded. Later updates compare against
+        # this, not against a missing field.
+        self._instructions_model_config = model_config
+        effective = _effective_instructions(config.instructions)
+        config.instructions = effective
+        prefix = self._encode_system_prefix(model_config, effective)
         if prefix is None:
             raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 cannot encode the system prompt")
         return {
             "model_type": PLUGIN_ID,
-            "instructions": instructions or DEFAULT_INSTRUCTIONS,
+            "instructions": effective,
             "system_prefix_token_ids": list(prefix),
         }
+
+    def drops_locked_instruction_updates(self) -> bool:
+        return True
 
     def runtime_config_for_update(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
     ) -> dict[str, object]:
-        # The prefix is already in the KV cache, so a later session update
-        # cannot change it.
-        if config.instructions != current.get("instructions"):
-            raise DuplexRuntimeConfigError(
-                "instructions cannot be changed after the session is created",
-                code="instructions_update_unsupported",
-            )
-        if self._speak_turn_modalities is not None and _modalities(config.modalities) != self._speak_turn_modalities:
-            raise DuplexRuntimeConfigError(
-                "modalities cannot be changed while a speak turn is open",
-                code="modalities_update_unsupported",
-            )
-        return dict(current)
+        updated = dict(current)
+        requested = _effective_instructions(config.instructions)
+        current_effective = _effective_instructions(updated.get("instructions"))
+        if requested != current_effective:
+            # The prefix is already in the KV cache. Drop the new sentence and
+            # keep adopting the rest of this update.
+            if self._submitted_prefix:
+                config.instructions = current_effective
+            else:
+                prefix = self._encode_system_prefix(self._instructions_model_config, requested)
+                if prefix is None:
+                    raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 cannot encode the system prompt")
+                config.instructions = requested
+                updated["instructions"] = requested
+                updated["system_prefix_token_ids"] = list(prefix)
+        else:
+            config.instructions = current_effective
+            if updated.get("instructions") != current_effective:
+                updated["instructions"] = current_effective
+        # A speak turn already snapshotted its modalities. Drop a different set
+        # and keep the other fields. The same set in another order is not a change.
+        if (
+            self._speak_turn_modalities is not None
+            and _modality_set(config.modalities) != _modality_set(self._speak_turn_modalities)
+        ):
+            config.modalities = list(self._speak_turn_modalities)
+        return updated
 
     def _encode_system_prefix(self, model_config: object | None, instructions: str) -> tuple[int, ...] | None:
         model_path = getattr(model_config, "model", None)

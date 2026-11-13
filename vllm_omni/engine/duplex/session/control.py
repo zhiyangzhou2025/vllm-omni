@@ -329,12 +329,17 @@ class SessionControl:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
-            self._out.emit_error(
-                "instructions_update_unsupported",
-                "session.update cannot change instructions after the native duplex context is initialized",
-                event_id=realtime_event_id,
-            )
-            return
+            # The prefix is already in the KV cache. Most models reject the
+            # whole update. A model that drops the field keeps the sentence it
+            # is already using and still adopts the rest, including modalities.
+            if not self._ctx.plugin.drops_locked_instruction_updates():
+                self._out.emit_error(
+                    "instructions_update_unsupported",
+                    "session.update cannot change instructions after the native duplex context is initialized",
+                    event_id=realtime_event_id,
+                )
+                return
+            candidate_config.instructions = session.config.instructions
         requests_audio = any(str(modality).lower() == "audio" for modality in candidate_config.modalities)
         if (
             requests_audio
