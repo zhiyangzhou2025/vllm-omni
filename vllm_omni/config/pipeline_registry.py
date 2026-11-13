@@ -121,6 +121,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     resolve_qwen3_omni_pipeline,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
+    QWEN3_OMNI_DUPLEX_PIPELINE,
     QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
     QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
 )
@@ -219,6 +220,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "pi05": PI05_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
+    "qwen3_omni_duplex": QWEN3_OMNI_DUPLEX_PIPELINE,
     "qwen3_omni_duplex_talker_code2wav": QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
     "qwen3_omni_duplex_thinker": QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,

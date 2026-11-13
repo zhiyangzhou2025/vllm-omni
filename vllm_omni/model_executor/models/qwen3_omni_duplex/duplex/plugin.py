@@ -53,14 +53,23 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = PLUGIN_ID
     silence_continuation_samples = INPUT_SAMPLES_PER_UNIT
     silence_continuation_sample_rate_hz = INPUT_SAMPLE_RATE_HZ
-    data_plane = Qwen3OmniDuplexDataPlane()
+    # Stage 0's text reaches the client even when a later stage is the final one.
+    projects_intermediate_outputs = True
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
+        # The data plane holds per-session state, so each plugin instance owns one.
+        encode_audio = args[0] if args else kwargs.get("encode_audio")
+        self.data_plane = Qwen3OmniDuplexDataPlane(encode_audio)
         # The system prefix is staged until the stage accepts the first append, so
         # a rejected append does not consume it.
         self._pending_prefix: dict[str, tuple[int, ...]] = {}
         self._submitted_prefix: dict[str, tuple[int, ...]] = {}
+
+    def configure_pipeline(self, pipeline_config: object) -> None:
+        stages = getattr(pipeline_config, "stages", ()) or ()
+        code2wav = next((stage.stage_id for stage in stages if getattr(stage, "model_stage", None) == "code2wav"), None)
+        self.data_plane.set_audio_stage(code2wav)
 
     def configure_sampling_params(
         self,
@@ -71,18 +80,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         del runtime_config
         # One append is one window. Decoding runs until the window closes, which
         # the protocol tokens signal, or until the window budget runs out.
+        # The window budget belongs to Stage 0. A later stage keeps its own
+        # max_tokens; only the output kind is shared, because the session is one
+        # resumable request and CUMULATIVE would repeat every window's output.
         configured = []
-        for default in defaults:
+        for index, default in enumerate(defaults):
             if not isinstance(default, SamplingParams):
                 configured.append(default)
                 continue
             params = default.clone()
-            params.max_tokens = MAX_GENERATED_TOKENS_PER_WINDOW
-            params.stop_token_ids = list(WINDOW_STOP_TOKEN_IDS)
-            # The session is one resumable request, so a window boundary never
-            # resets the output state. CUMULATIVE would hand the data plane the
-            # whole session's text again on every decode step.
             params.output_kind = RequestOutputKind.DELTA
+            if index == 0:
+                params.max_tokens = MAX_GENERATED_TOKENS_PER_WINDOW
+                params.stop_token_ids = list(WINDOW_STOP_TOKEN_IDS)
             configured.append(params)
         return tuple(configured)
 
@@ -134,8 +144,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None:
-        del stage_id, final_stage_id, segment_token_ids, segment_output_metadata
+        del segment_token_ids, segment_output_metadata
         if not segment_finished:
+            return None
+        # A stage past Stage 0 has nothing to decide: its output is audio, and the
+        # orchestrator forwards it on its own.
+        if stage_id > 0:
             return None
         # The segment snapshot holds only the step that closed the window, so
         # the decision comes from the output's own cumulative token history.
@@ -143,8 +157,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if decision is None:
             return None
         native_decision = "listen" if decision == "listen" else "speak"
-        # No downstream stage exists yet, so both decisions close the segment
-        # here. The sampled token is what the client sees.
+        # A speak window still has its audio to produce, so it goes to the next
+        # stage. A listen window is finished here, and so is a speak window when
+        # Stage 0 is the last stage.
+        if stage_id < final_stage_id and decision != "listen":
+            return None
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata={

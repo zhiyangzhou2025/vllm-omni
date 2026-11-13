@@ -57,6 +57,7 @@ def _stage(
     input_sources: tuple[int, ...] = (),
     model_arch: str | None = None,
     sampling_constraints: dict[str, Any] | None = None,
+    custom_process_input_func: str | None = None,
     custom_process_next_stage_input_func: str | None = None,
     async_chunk_process_next_stage_input_func: str | None = None,
     requires_full_payload_input: bool = False,
@@ -77,6 +78,7 @@ def _stage(
         engine_output_type=engine_output_type,
         model_arch=model_arch,
         sampling_constraints={"detokenize": owns_tokenizer, **(sampling_constraints or {})},
+        custom_process_input_func=custom_process_input_func,
         custom_process_next_stage_input_func=custom_process_next_stage_input_func,
         async_chunk_process_next_stage_input_func=async_chunk_process_next_stage_input_func,
         requires_full_payload_input=requires_full_payload_input,
@@ -162,6 +164,65 @@ QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE = PipelineConfig(
             # Code2Wav reads codes out of the checkpoint's own module and needs
             # nothing the duplex protocol adds, so this one stage overrides the
             # pipeline-wide duplex class back to the official one.
+            model_arch=_ARCH,
+            sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
+        ),
+    ),
+)
+
+_DUPLEX_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_omni_duplex"
+
+QWEN3_OMNI_DUPLEX_PIPELINE = PipelineConfig(
+    model_type="qwen3_omni_duplex",
+    model_arch=_DUPLEX_ARCH,
+    duplex_plugin="vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.plugin.Qwen3OmniDuplexPlugin",
+    stages=(
+        # The Thinker forwards its hidden states, not its text: the Talker
+        # projects those rows. ``latent`` is what carries them.
+        _stage(
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            final_output_type="text",
+            engine_output_type="latent",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+        ),
+        # The Talker is fed by the duplex processor, which turns one closed speak
+        # window into the turn's next step. There is no connector into it, so it
+        # does not wait for a full upstream payload.
+        _stage(
+            stage_id=1,
+            model_stage="talker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            final_output_type=None,
+            engine_output_type="latent",
+            owns_tokenizer=False,
+            requires_multimodal_data=False,
+            hf_config_name="talker_config",
+            sampling_constraints={
+                "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
+                "max_tokens": AUDIO_TOKENS_PER_UNIT,
+            },
+            custom_process_input_func=f"{_DUPLEX_PROC}.thinker2talker",
+            # The shared streamed edge restarts its frame cache per window. The
+            # duplex wrapper keeps the turn's frames and prepends them.
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_DUPLEX_PROC}.talker2code2wav_async_chunk",
+            recompute_preemption="fail",
+        ),
+        _stage(
+            stage_id=2,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(1,),
+            final_output_type="audio",
+            engine_output_type="audio",
+            owns_tokenizer=False,
+            requires_multimodal_data=False,
+            hf_config_name="thinker_config",
             model_arch=_ARCH,
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,

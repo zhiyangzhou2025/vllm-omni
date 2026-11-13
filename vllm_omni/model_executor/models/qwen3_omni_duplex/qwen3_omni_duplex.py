@@ -15,6 +15,10 @@ from typing import Any
 
 import torch
 
+from vllm.config import CUDAGraphMode
+
+from vllm_omni.platforms import current_omni_platform
+
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
 )
@@ -42,6 +46,14 @@ _TEXT_PROBE_TOKEN_ID = 0
 # call. Its subtree under the checkpoint's own naming.
 _CODE_PREDICTOR_PREFIX = "talker.code_predictor."
 
+# The stage input processor ships the Thinker's rows as lists, and names the
+# dtype each list rebuilds as under this key of the Talker's payload.
+_TRANSPORT_DTYPES_KEY = "duplex_transport_dtypes"
+# The processor numbers the windows of one turn, and records under this key the
+# last one whose text the Talker already queued.
+_WINDOW_KEY = "duplex_talker_window"
+_APPENDED_KEY = "duplex_talker_appended"
+
 
 class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGeneration):
     """Qwen3-Omni runtime that holds both stages to the duplex window."""
@@ -52,6 +64,17 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._wire_stage_hooks()
+        # The frame-synchronous Talker (additional_config flag) keeps the codec
+        # just sampled, and the summed embedding the code predictor returned for
+        # it, so the next step can decode from them.
+        self._duplex_talker_stash: dict[str, dict[str, torch.Tensor | int]] = {}
+
+    def _frame_sync(self) -> bool:
+        """Whether this Talker decodes each frame from the codec just sampled."""
+
+        config = self.__dict__.get("vllm_config")
+        additional = getattr(config, "additional_config", None)
+        return bool(isinstance(additional, Mapping) and additional.get("qwen3_omni_duplex_frame_sync"))
 
     def _wire_stage_hooks(self) -> None:
         """Expose only the hooks that belong to the stage being served.
@@ -75,7 +98,13 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             return
         # post_sample_talker_mtp below is the thinker's window bookkeeping, and
         # it answers with placeholder rows. On the talker stage the runner would
-        # merge those over the codec codes talker_mtp just produced.
+        # merge those over the codec codes talker_mtp just produced. The
+        # frame-synchronous Talker is the exception: it has no lagged decode-time
+        # code predictor, and its post-sample hook returns the step's codes.
+        if self.model_stage == "talker" and self._frame_sync():
+            self.talker_mtp = None
+            self.post_sample_talker_mtp = self._frame_sync_codes
+            return
         self.post_sample_talker_mtp = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -91,7 +120,27 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         files, cutting layer 3 between its q/k/v and its gate/up shards, so the
         order it arrives in has to be repaired before the parent routes it.
         """
-        return super().load_weights(_code_predictor_last(weights))
+        loaded = super().load_weights(_code_predictor_last(weights))
+        # The code predictor's first call compiles under the dtype the step
+        # thread runs with, which is not the dtype the weights load under. Two
+        # calls here pay that cost at startup instead of on the first frame.
+        if self.model_stage == "talker" and self._frame_sync():
+            device = next(self.parameters()).device
+            hidden = torch.zeros(
+                (1, self.talker_config.text_config.hidden_size),
+                device=device,
+                dtype=self.vllm_config.model_config.dtype,
+            )
+            token = torch.zeros((1,), device=device, dtype=torch.long)
+            previous_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch.float32)
+            try:
+                with torch.inference_mode():
+                    for _ in range(2):
+                        self._run_code_predictor(token, hidden)
+            finally:
+                torch.set_default_dtype(previous_dtype)
+        return loaded
 
     def thinker_preprocess(
         self,
@@ -288,6 +337,97 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         )
         return ids, text.to(codec.dtype) + codec
 
+    def talker_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+        **info: object,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+        """Rebuild the transported rows, then decode a frame from the last codec.
+
+        The Thinker's rows cross the stage boundary as lists. They are rebuilt
+        here, in place, because the runner keeps handing this payload back.
+
+        With frame sync on, a turn's later window arrives as one placeholder
+        token the scheduler treats as prefill. It is a decode step: the window
+        adds no context, and its codec is the one the previous step sampled.
+        That step's summed codec embedding, stashed by the post-sample hook,
+        replaces the embedding the runner built for the placeholder.
+        """
+
+        dtypes = info.get(_TRANSPORT_DTYPES_KEY)
+        if isinstance(dtypes, Mapping):
+            for dotted, dtype_name in dtypes.items():
+                top, key = str(dotted).split(".", 1)
+                sub = info.get(top)
+                if isinstance(sub, dict) and isinstance(sub.get(key), list):
+                    sub[key] = torch.tensor(sub[key], dtype=getattr(torch, dtype_name))
+        if self._frame_sync() and self._is_continuation_step(input_ids, info):
+            info = {**info, "_omni_is_prefill": False}
+        meta = info.get("meta") if isinstance(info.get("meta"), Mapping) else {}
+        if info.get("_omni_is_prefill") and meta.get("duplex_talker_turn_start") is True:
+            # A new turn: Code2Wav must not take the last turn's frames as context.
+            from vllm_omni.model_executor.stage_input_processors.qwen3_omni_duplex import mark_turn_start
+
+            mark_turn_start(str(info.get("request_id")))
+        ids, embeds, update = super().talker_preprocess(input_ids, input_embeds, **info)
+        if self._frame_sync() and not info.get("_omni_is_prefill"):
+            request_id = info.get("request_id")
+            stash = self._duplex_talker_stash.get(request_id)
+            if stash is None:
+                raise RuntimeError(f"Qwen3-Omni-Duplex Talker decoded before its first frame was sampled: {request_id}")
+            _, text_step = update.pop("mtp_inputs")
+            text_step = text_step.reshape(1, -1)
+            summed = stash["summed"]
+            embeds = (summed.to(text_step.device, text_step.dtype) + text_step).to(embeds.dtype)
+            ids = torch.full_like(input_ids, int(stash["tok"]))
+        return ids, embeds, update
+
+    def _is_continuation_step(self, input_ids: torch.Tensor, info: Mapping[str, object]) -> bool:
+        """A turn's later window: one placeholder token, and not the turn's first."""
+
+        meta = info.get("meta") if isinstance(info.get("meta"), Mapping) else {}
+        if meta.get("duplex_talker_turn_start") is True:
+            return False
+        span = int(input_ids.shape[0])
+        computed = _optional_int(info.get("_omni_num_computed_tokens"), None)
+        prompt_len = _optional_int(info.get("_omni_prompt_len"), None)
+        return bool(info.get("_omni_is_prefill")) and span == 1 and computed == prompt_len - 1
+
+    def _frame_sync_codes(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        req_ids: list[str],
+        **_: object,
+    ) -> torch.Tensor:
+        """Run the code predictor on the codec token just sampled.
+
+        The runner calls this after its sampler and passes the sampled token per
+        request. The codes it returns are this step's frame; the summed codec
+        embedding is what the next step decodes from.
+        """
+
+        tokens = input_ids.reshape(-1).to(torch.long)
+        hidden = hidden_states.reshape(len(req_ids), -1)
+        summed, codes = self._run_code_predictor(tokens, hidden)
+        for index, request_id in enumerate(req_ids):
+            self._duplex_talker_stash[request_id] = {
+                "tok": int(tokens[index]),
+                "summed": summed[index : index + 1].detach().clone(),
+            }
+        return codes.reshape(len(req_ids), -1)
+
+    def _run_code_predictor(self, tokens: torch.Tensor, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros_like(hidden)
+        with current_omni_platform.set_forward_context(
+            None, self.vllm_config, cudagraph_runtime_mode=CUDAGraphMode.NONE, batch_descriptor=None
+        ):
+            summed, codes = Qwen3OmniMoeForConditionalGeneration.talker_mtp(self, tokens, hidden, hidden, zeros)
+        torch.cuda.synchronize()
+        return summed, codes
+
     def talker_preprocess_decode(
         self,
         input_ids: torch.Tensor,
@@ -312,10 +452,13 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         pad = self.tts_pad_embed.to(device, dtype=dtype)
         hs = payload.get("hidden_states", {})
         queue = hs.get("trailing_text")
-        if isinstance(queue, torch.Tensor) and queue.numel() > 0:
-            text_step = queue[0:1, :].to(device, dtype=dtype)
-            rest = queue[1:, :].detach() if queue.shape[0] > 1 else pad
-            update_dict.setdefault("hidden_states", {})["trailing_text"] = rest
+        queue = queue.to(device, dtype=dtype) if isinstance(queue, torch.Tensor) else None
+        queue = self._append_window_text(queue, update_dict, payload, device, dtype)
+        if queue is not None and queue.numel() > 0:
+            text_step = queue[0:1, :]
+            # An exhausted queue is stored empty. A stored pad row would sit in
+            # front of the text the turn's next window appends.
+            update_dict.setdefault("hidden_states", {})["trailing_text"] = queue[1:, :].detach()
         else:
             text_step = pad
 
@@ -326,6 +469,39 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
         else:
             last_talker_hidden = last.to(device, dtype=dtype).reshape(*last.shape[-2:])
         return last_talker_hidden, text_step, update_dict
+
+    def _append_window_text(
+        self,
+        queue: torch.Tensor | None,
+        update_dict: dict[str, Any],
+        payload: Mapping[str, Any],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Queue one window's text the first time the Talker decodes it.
+
+        A window's text arrives with the window and is appended once. The final
+        window of a turn also ends the text with ``<|tts_eos|>``.
+        """
+
+        meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+        window = meta.get(_WINDOW_KEY)
+        if window is None or window == meta.get(_APPENDED_KEY):
+            return queue
+        duplex = payload.get("duplex") if isinstance(payload.get("duplex"), Mapping) else {}
+        final = bool((duplex.get("payload") or {}).get("final_window"))
+        addition = None
+        if meta.get("duplex_talker_turn_start") is not True:
+            ids = torch.as_tensor(payload["ids"]["duplex_talker_append"], dtype=torch.long, device=device)
+            rows = payload["hidden_states"]["duplex_talker_append"].to(device)
+            addition = self._duplex_text_queue(ids, rows).to(device, dtype=dtype)
+        if final:
+            eos = self.tts_eos_embed.to(device, dtype=dtype).reshape(1, -1)
+            addition = eos if addition is None else torch.cat([addition, eos], 0)
+        if addition is not None:
+            queue = addition if queue is None or queue.numel() == 0 else torch.cat([queue, addition], 0)
+        update_dict.setdefault("meta", {})[_APPENDED_KEY] = window
+        return queue
 
     def prepare_duplex_sampling(self, logits: torch.Tensor, sampling_metadata: object, rows: object) -> None:
         """Mask every logit the current window phase does not allow.

@@ -130,6 +130,27 @@ def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
     assert speak is not None and speak.metadata["duplex_native_decision"] == "speak"
     assert unfinished is None
 
+    # A deployment with a stage after Stage 0 forwards the speak window and still
+    # closes the listen window here.
+    forwarded = plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(DUPLEX_TOKENS.unit_end,),
+        segment_output_metadata={},
+        output=_stage_output((DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)),
+    )
+    kept = plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(DUPLEX_TOKENS.unit_end,),
+        segment_output_metadata={},
+        output=_stage_output((DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)),
+    )
+    assert forwarded is None
+    assert kept is not None and kept.metadata["duplex_native_decision"] == "listen"
+
 
 def test_capabilities_are_resumable_and_audio_only() -> None:
     capabilities = Qwen3OmniDuplexPlugin(lambda *_args: None).capabilities(max_sessions=1)
@@ -214,6 +235,15 @@ def test_window_sampling_stops_on_the_protocol_tokens() -> None:
     # The whole session is one resumable request, so cumulative output would
     # resend every earlier window's text on every step.
     assert params.output_kind == RequestOutputKind.DELTA
+
+    # The window budget is Stage 0's. A later stage keeps the budget its pipeline
+    # declared and only shares the output kind.
+    stage0, stage1 = plugin.configure_sampling_params(
+        runtime_config={}, defaults=(SamplingParams(temperature=0.0), SamplingParams(max_tokens=6))
+    )
+    assert stage1.max_tokens == 6
+    assert not stage1.stop_token_ids
+    assert stage1.output_kind == RequestOutputKind.DELTA
 
 
 def test_a_window_is_dated_by_the_unit_ends_before_it() -> None:

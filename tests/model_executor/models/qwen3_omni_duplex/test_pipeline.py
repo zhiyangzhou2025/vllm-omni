@@ -8,6 +8,7 @@ import yaml
 
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import CODEC_FRAMES_PER_WINDOW
 from vllm_omni.model_executor.models.qwen3_omni_duplex.pipeline import (
+    QWEN3_OMNI_DUPLEX_PIPELINE,
     QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
     QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
 )
@@ -16,6 +17,7 @@ CODEC_EOS_TOKEN_ID = 2150
 PIPELINES = {
     "qwen3_omni_duplex_stage0.yaml": QWEN3_OMNI_DUPLEX_THINKER_PIPELINE,
     "qwen3_omni_duplex_stage12.yaml": QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE,
+    "qwen3_omni_duplex.yaml": QWEN3_OMNI_DUPLEX_PIPELINE,
 }
 DEPLOY_DIR = Path(__file__).parents[4] / "vllm_omni" / "deploy"
 # The Talker is served only through the Talker+Code2Wav pair, so its own
@@ -92,6 +94,29 @@ def test_the_talker_hands_its_codes_down_instead_of_returning_them() -> None:
     # overrides the pipeline-wide duplex class back to the official one.
     assert QWEN3_OMNI_DUPLEX_TALKER_CODE2WAV_PIPELINE.model_arch == "Qwen3OmniDuplexForConditionalGeneration"
     assert code2wav.model_arch == "Qwen3OmniMoeForConditionalGeneration"
+
+
+def test_the_three_stage_topology_forwards_hidden_states_and_keeps_turn_frames() -> None:
+    thinker, talker, code2wav = QWEN3_OMNI_DUPLEX_PIPELINE.stages
+
+    # The Talker projects the Thinker's rows, so the Thinker forwards them.
+    assert thinker.engine_output_type == "latent"
+    assert thinker.final_output_type == "text"
+    # The plugin is what turns a closed speak window into the next Talker step.
+    assert talker.custom_process_input_func == (
+        "vllm_omni.model_executor.stage_input_processors.qwen3_omni_duplex.thinker2talker"
+    )
+    # No connector feeds the Talker, so it does not wait for a full payload.
+    assert talker.requires_full_payload_input is False
+    # The shared streamed edge restarts its frame cache per window; the duplex
+    # wrapper keeps the turn's frames.
+    assert talker.async_chunk_process_next_stage_input_func == (
+        "vllm_omni.model_executor.stage_input_processors.qwen3_omni_duplex.talker2code2wav_async_chunk"
+    )
+    assert talker.input_sources == (0,)
+    assert code2wav.input_sources == (1,)
+    assert code2wav.model_arch == "Qwen3OmniMoeForConditionalGeneration"
+    assert QWEN3_OMNI_DUPLEX_PIPELINE.duplex_plugin.endswith("Qwen3OmniDuplexPlugin")
 
 
 def test_the_thinker_stage_keeps_its_own_settings() -> None:

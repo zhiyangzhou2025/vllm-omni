@@ -44,7 +44,9 @@ def test_each_step_takes_the_next_queued_text_row(async_chunk: bool) -> None:
 
     _, text, update = _step(talker, {"hidden_states": {"trailing_text": rest}})
     assert text.tolist() == [[2.0, 2.0]]
-    assert update["hidden_states"]["trailing_text"].tolist() == PAD.tolist()
+    # An exhausted queue is stored empty, so the next window's text is not queued
+    # behind a pad row.
+    assert update["hidden_states"]["trailing_text"].shape == (0, HIDDEN)
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])

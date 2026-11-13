@@ -189,6 +189,51 @@ def test_a_checkpoint_without_a_user_signal_reports_nothing() -> None:
     assert events == []
 
 
+def test_a_deployment_with_audio_moves_the_turn_end_to_the_last_chunk() -> None:
+    import numpy as np
+    import torch
+
+    encoded: list[int] = []
+    plane = Qwen3OmniDuplexDataPlane(lambda samples, *_args: encoded.append(int(samples.size)) or "pcm")
+    plane.set_audio_stage(2)
+    context = DuplexDataPlaneContext(modalities=("audio",), active_response_turn_id=0, turn_id=0)
+
+    def audio_output() -> SimpleNamespace:
+        return SimpleNamespace(
+            request_id="req",
+            stage_id=2,
+            finished=True,
+            outputs=[SimpleNamespace()],
+            multimodal_output={"audio": [torch.zeros(4)]},
+        )
+
+    # DELTA output: the text rides the step that sampled it, and the window
+    # closes on the step that samples unit_end, which is where the turn's audio
+    # chunk is accounted for. The text goes out at once; the turn is not over.
+    spoken = next(iter(plane.project(_result([DUPLEX_TOKENS.speak, 100], text="hi"), context=context)))
+    assert spoken["text"] == "hi"
+    closed = next(
+        iter(
+            plane.project(
+                _result([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]), context=context
+            )
+        )
+    )
+    assert closed["end_of_turn"] is False
+
+    # The turn's audio chunk carries the end, and the samples reach the encoder.
+    chunk = next(iter(plane.project({"data_plane_outputs": [audio_output()]}, context=context)))
+    assert chunk["audio_data"] == "pcm"
+    assert chunk["end_of_turn"] is True
+    assert encoded == [4]
+    assert chunk["audio_duration_ms"] == 4 * 1000 / 24000
+
+    # A text-only session never sees the audio stage's output.
+    text_only = list(Qwen3OmniDuplexDataPlane().project({"data_plane_outputs": [audio_output()]}))
+    assert text_only == []
+    del np
+
+
 def test_the_window_is_tagged_with_the_session_model_turn() -> None:
     # The context is a dataclass, not a mapping. Reading it as a mapping tagged
     # every window with turn 0, and the session dropped each model turn after
