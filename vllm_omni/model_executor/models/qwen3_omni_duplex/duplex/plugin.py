@@ -47,6 +47,12 @@ SYSTEM_PREFIX_TEMPLATE = "<|im_start|>system\n{instructions}<|im_end|>\n"
 WINDOW_STOP_TOKEN_IDS = (DUPLEX_TOKENS.unit_end,)
 
 
+def _modalities(values: object) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple)):
+        return ()
+    return tuple(str(item).lower() for item in values)
+
+
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     """Serve Stage 0 as one resumable request of exact audio windows."""
 
@@ -65,6 +71,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # a rejected append does not consume it.
         self._pending_prefix: dict[str, tuple[int, ...]] = {}
         self._submitted_prefix: dict[str, tuple[int, ...]] = {}
+        # A speak turn's output modalities, snapshotted when its first window
+        # closes. ``None`` means no turn is open. The live session value can
+        # change while the turn's later windows are still being generated, so
+        # those windows read this snapshot rather than the attribute below.
+        self._speak_turn_modalities: tuple[str, ...] | None = None
 
     def configure_pipeline(self, pipeline_config: object) -> None:
         stages = getattr(pipeline_config, "stages", ()) or ()
@@ -157,10 +168,20 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if decision is None:
             return None
         native_decision = "listen" if decision == "listen" else "speak"
+        # The first window of a speak turn freezes the modalities the Talker
+        # will see. A text-only turn never starts the Talker; a later window of
+        # an audio turn cannot be dropped without leaving the Talker mid-turn.
+        if decision != "listen" and self._speak_turn_modalities is None:
+            bound = getattr(self, "output_modalities", None)
+            if bound is not None:
+                self._speak_turn_modalities = _modalities(bound)
+        wants_audio = self._speak_turn_modalities is None or "audio" in self._speak_turn_modalities
+        if decision == "turn_end":
+            self._speak_turn_modalities = None
         # A speak window still has its audio to produce, so it goes to the next
         # stage. A listen window is finished here, and so is a speak window when
-        # Stage 0 is the last stage.
-        if stage_id < final_stage_id and decision != "listen":
+        # Stage 0 is the last stage or the turn was opened without audio.
+        if stage_id < final_stage_id and decision != "listen" and wants_audio:
             return None
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
@@ -240,6 +261,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError(
                 "instructions cannot be changed after the session is created",
                 code="instructions_update_unsupported",
+            )
+        if self._speak_turn_modalities is not None and _modalities(config.modalities) != self._speak_turn_modalities:
+            raise DuplexRuntimeConfigError(
+                "modalities cannot be changed while a speak turn is open",
+                code="modalities_update_unsupported",
             )
         return dict(current)
 

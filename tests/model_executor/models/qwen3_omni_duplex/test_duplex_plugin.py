@@ -152,6 +152,71 @@ def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
     assert kept is not None and kept.metadata["duplex_native_decision"] == "listen"
 
 
+def _decide(plugin: Qwen3OmniDuplexPlugin, token_ids: tuple[int, ...], *, modalities: tuple[str, ...] | None) -> object:
+    if modalities is None:
+        plugin.__dict__.pop("output_modalities", None)
+    else:
+        plugin.output_modalities = modalities
+    return plugin.decide_output(
+        stage_id=0,
+        final_stage_id=2,
+        segment_finished=True,
+        segment_token_ids=(token_ids[-1],),
+        segment_output_metadata={},
+        output=_stage_output(token_ids),
+    )
+
+
+def test_text_only_speak_turn_is_not_forwarded_and_stays_locked() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    speak = (DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)
+    later = (DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end, DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.unit_end)
+
+    first = _decide(plugin, speak, modalities=("text",))
+    # A live change during the turn does not reopen the Talker. The snapshot
+    # taken when the turn opened is what the later window is judged against.
+    second = _decide(plugin, later, modalities=("text", "audio"))
+
+    assert first is not None and first.metadata["duplex_native_decision"] == "speak"
+    assert second is not None and second.metadata["duplex_native_decision"] == "speak"
+    assert plugin._speak_turn_modalities == ("text",)
+    with pytest.raises(Exception, match="modalities cannot be changed"):
+        plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["text", "audio"]), {"instructions": None})
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["text"]), {"instructions": None}) == {
+        "instructions": None
+    }
+
+
+def test_speak_turn_lock_clears_on_turn_eos_and_the_next_turn_can_enable_audio() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    ending = (DUPLEX_TOKENS.speak, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end)
+    nxt = (*ending, DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)
+
+    closed = _decide(plugin, ending, modalities=("text",))
+    assert closed is not None
+    assert plugin._speak_turn_modalities is None
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["audio"]), {"instructions": None}) == {
+        "instructions": None
+    }
+    forwarded = _decide(plugin, nxt, modalities=("text", "audio"))
+    assert forwarded is None
+    assert plugin._speak_turn_modalities == ("text", "audio")
+
+
+def test_listen_window_does_not_open_or_clear_the_speak_turn_lock() -> None:
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    listen = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)
+
+    assert _decide(plugin, listen, modalities=("text",)) is not None
+    assert plugin._speak_turn_modalities is None
+
+    speak = (DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)
+    assert _decide(plugin, speak, modalities=("text", "audio")) is None
+    mid_listen = (*speak, DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)
+    assert _decide(plugin, mid_listen, modalities=("text",)) is not None
+    assert plugin._speak_turn_modalities == ("text", "audio")
+
+
 def test_capabilities_are_resumable_and_audio_only() -> None:
     capabilities = Qwen3OmniDuplexPlugin(lambda *_args: None).capabilities(max_sessions=1)
 

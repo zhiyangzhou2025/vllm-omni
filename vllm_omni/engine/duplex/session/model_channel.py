@@ -597,6 +597,9 @@ class ModelChannel:
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> DuplexOutputDecision | None:
         """Pure plugin decision (no session mutation: this runs inline on the orchestrator loop)."""
+        # The opening window of a turn closes after its append, so the plugin
+        # cannot read modalities from the append plan. Hand it the live value.
+        self._ctx.plugin.output_modalities = tuple(self._ctx.session.response_config.modalities)
         decision = self._ctx.plugin.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,
