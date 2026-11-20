@@ -62,8 +62,7 @@ class _TurnAudio:
 
     s_turn: int = 0
     done_turn: int = 0
-    held: str = ""
-    held_turn: int | None = None
+    held: dict[int, str] = field(default_factory=dict)
     template: dict[str, object] | None = None
     windows: deque[tuple[int, bool]] = field(default_factory=deque)
 
@@ -77,6 +76,7 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         # this deployment has no audio stage, so Stage 0 behaves as before.
         self._audio_stage: int | None = None
         self._turns: dict[str, _TurnAudio] = {}
+        self.on_close_session: Any = None
 
     def set_audio_stage(self, stage_id: int | None) -> None:
         self._audio_stage = stage_id
@@ -97,6 +97,8 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
 
     def close_session(self, session_id: str, *, active_request_id: str | None = None) -> None:
         del active_request_id
+        if self.on_close_session is not None:
+            self.on_close_session(session_id)
         self.terminal = {
             request_id
             for request_id in self.terminal
@@ -218,26 +220,23 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         for output in stage0:
             request_id = output.request_id
             turns = self._turns.setdefault(request_id, _TurnAudio())
-            if turns.held and turns.done_turn >= turns.held_turn and turns.template is not None:
-                active = getattr(context, "active_response_turn_id", None)
+            if turns.done_turn in turns.held and turns.template is not None:
                 yield {
                     **turns.template,
-                    "text": turns.held,
+                    "text": turns.held.pop(turns.done_turn),
                     "is_listen": False,
                     "model_listen": False,
                     "end_of_turn": False,
                     "user_speech_events": [],
-                    "model_turn_id": model_turn_id if active is not None else getattr(context, "turn_id", 0),
+                    "model_turn_id": model_turn_id,
                 }
-                turns.held = ""
             for projected in self._project_stage0(
                 output, model_turn_id=model_turn_id, response_format=response_format
             ):
                 in_flight = turns.done_turn < turns.s_turn
                 turns.template = dict(projected)
                 if projected["text"] and in_flight:
-                    turns.held += str(projected["text"])
-                    turns.held_turn = turns.s_turn
+                    turns.held[turns.s_turn] = turns.held.get(turns.s_turn, "") + str(projected["text"])
                     projected["text"] = ""
                 projected["end_of_turn"] = False
                 decision = window_decision(window_token_ids(next(iter(getattr(output, "outputs", ()) or ()), None)))
@@ -253,6 +252,16 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
             request_id = output.request_id
             turns = self._turns.setdefault(request_id, _TurnAudio())
             window_turn, final = turns.windows.popleft()
+            if window_turn in turns.held and turns.done_turn >= window_turn and turns.template is not None:
+                yield {
+                    **turns.template,
+                    "text": turns.held.pop(window_turn),
+                    "is_listen": False,
+                    "model_listen": False,
+                    "end_of_turn": False,
+                    "user_speech_events": [],
+                    "model_turn_id": model_turn_id,
+                }
             if final:
                 turns.done_turn = window_turn + 1
             samples = _audio_samples(output)

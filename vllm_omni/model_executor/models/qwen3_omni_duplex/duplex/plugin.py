@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from uuid import uuid4
 
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -78,6 +79,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # The data plane holds per-session state, so each plugin instance owns one.
         encode_audio = args[0] if args else kwargs.get("encode_audio")
         self.data_plane = Qwen3OmniDuplexDataPlane(encode_audio)
+        self.data_plane.on_close_session = self._close_session
+        self._request_session_keys: dict[str, str] = {}
         # The system prefix is staged until the stage accepts the first append, so
         # a rejected append does not consume it.
         self._pending_prefix: dict[str, tuple[int, ...]] = {}
@@ -86,7 +89,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # closes. ``None`` means no turn is open. The live session value can
         # change while the turn's later windows are still being generated, so
         # those windows read this snapshot rather than the attribute below.
-        self._speak_turn_modalities: tuple[str, ...] | None = None
+        self._speak_turn_modalities: dict[str, tuple[str, ...]] = {}
         # Kept so a session update before the first window can re-encode the prefix.
         self._instructions_model_config: object | None = None
 
@@ -143,6 +146,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # Only the first append carries tokens of its own: the system prefix.
         # Later appends close the previous window with ``<|unit_end|>``, which
         # ``build_audio_window_prompt`` reserves from the sequence number.
+        self._request_session_keys[request_id] = str(runtime_config.get("duplex_session_key", request_id))
         prefix = () if request_id in self._submitted_prefix else self._system_prefix_token_ids(runtime_config)
         prompt = build_audio_window_prompt(
             request_id=request_id,
@@ -181,16 +185,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if decision is None:
             return None
         native_decision = "listen" if decision == "listen" else "speak"
+        request_id = getattr(output, "request_id", "")
+        session_key = self._request_session_keys.get(request_id, request_id)
+        locked = self._speak_turn_modalities.get(session_key)
         # The first window of a speak turn freezes the modalities the Talker
         # will see. A text-only turn never starts the Talker; a later window of
         # an audio turn cannot be dropped without leaving the Talker mid-turn.
-        if decision != "listen" and self._speak_turn_modalities is None:
+        if decision != "listen" and locked is None:
             bound = getattr(self, "output_modalities", None)
             if bound is not None:
-                self._speak_turn_modalities = _modalities(bound)
-        wants_audio = self._speak_turn_modalities is None or "audio" in self._speak_turn_modalities
+                locked = self._speak_turn_modalities[session_key] = _modalities(bound)
+        wants_audio = locked is None or "audio" in locked
         if decision == "turn_end":
-            self._speak_turn_modalities = None
+            self._speak_turn_modalities.pop(session_key, None)
         # A speak window still has its audio to produce, so it goes to the next
         # stage. A listen window is finished here, and so is a speak window when
         # Stage 0 is the last stage or the turn was opened without audio.
@@ -209,6 +216,16 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         prefix = self._pending_prefix.pop(request_id, None)
         if prefix is not None:
             self._submitted_prefix[request_id] = prefix
+
+    def _close_session(self, session_id: str) -> None:
+        from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
+
+        for request_id in list(self._request_session_keys):
+            if duplex_resource_request_belongs_to_session(request_id, session_id):
+                key = self._request_session_keys.pop(request_id)
+                self._speak_turn_modalities.pop(key, None)
+                self._pending_prefix.pop(request_id, None)
+                self._submitted_prefix.pop(request_id, None)
 
     def create_session_state(self) -> Qwen3OmniDuplexSessionState:
         return Qwen3OmniDuplexSessionState()
@@ -265,6 +282,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             "model_type": PLUGIN_ID,
             "instructions": effective,
             "system_prefix_token_ids": list(prefix),
+            "duplex_session_key": uuid4().hex,
         }
 
     def drops_locked_instruction_updates(self) -> bool:
@@ -281,7 +299,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if requested != current_effective:
             # The prefix is already in the KV cache. Drop the new sentence and
             # keep adopting the rest of this update.
-            if self._submitted_prefix:
+            session_key = current.get("duplex_session_key")
+            if any(self._request_session_keys.get(request_id) == session_key for request_id in self._submitted_prefix):
                 config.instructions = current_effective
             else:
                 prefix = self._encode_system_prefix(self._instructions_model_config, requested)
@@ -296,11 +315,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 updated["instructions"] = current_effective
         # A speak turn already snapshotted its modalities. Drop a different set
         # and keep the other fields. The same set in another order is not a change.
-        if (
-            self._speak_turn_modalities is not None
-            and _modality_set(config.modalities) != _modality_set(self._speak_turn_modalities)
-        ):
-            config.modalities = list(self._speak_turn_modalities)
+        locked = self._speak_turn_modalities.get(str(current.get("duplex_session_key", "")))
+        if locked is not None and _modality_set(config.modalities) != _modality_set(locked):
+            config.modalities = list(locked)
         return updated
 
     def _encode_system_prefix(self, model_config: object | None, instructions: str) -> tuple[int, ...] | None:

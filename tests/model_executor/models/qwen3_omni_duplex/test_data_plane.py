@@ -234,6 +234,74 @@ def test_a_deployment_with_audio_moves_the_turn_end_to_the_last_chunk() -> None:
     del np
 
 
+def test_held_next_turn_text_flushes_before_its_audio_without_another_thinker_step() -> None:
+    import torch
+
+    plane = Qwen3OmniDuplexDataPlane(lambda *_args: "pcm")
+    plane.set_audio_stage(2)
+
+    def project_stage0(tokens: list[int], text: str, turn: int) -> list[dict[str, object]]:
+        return list(
+            plane.project(
+                _result(tokens, text=text),
+                context=DuplexDataPlaneContext(modalities=("text", "audio"), active_response_turn_id=turn),
+            )
+        )
+
+    def project_audio(turn: int) -> list[dict[str, object]]:
+        output = SimpleNamespace(
+            request_id="req", stage_id=2, outputs=[SimpleNamespace()], multimodal_output={"audio": [torch.zeros(4)]}
+        )
+        return list(
+            plane.project(
+                {"data_plane_outputs": [output]},
+                context=DuplexDataPlaneContext(modalities=("text", "audio"), active_response_turn_id=turn),
+            )
+        )
+
+    project_stage0([DUPLEX_TOKENS.speak, 100], "previous", 0)
+    project_stage0([DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end], "", 0)
+    held = project_stage0([DUPLEX_TOKENS.speak, 101], "later", 0)
+    project_stage0([DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end], "", 0)
+
+    assert [event["text"] for event in held] == [""]
+    assert [event["text"] for event in project_audio(0)] == [""]
+    next_turn = project_audio(1)
+    assert [(event["text"], event["audio_data"], event["model_turn_id"], event["end_of_turn"]) for event in next_turn] == [
+        ("later", "", 1, False),
+        ("", "pcm", 1, True),
+    ]
+    assert plane._turns["req"].held == {}
+
+
+def test_held_text_of_two_future_turns_stays_with_its_audio() -> None:
+    import torch
+
+    plane = Qwen3OmniDuplexDataPlane(lambda *_args: "pcm")
+    plane.set_audio_stage(2)
+    tokens: list[int] = []
+    for number, word in enumerate(("zero", "one", "two")):
+        tokens.extend([DUPLEX_TOKENS.speak, 100 + number])
+        list(plane.project(_result(tokens, text=word), context=DuplexDataPlaneContext(modalities=("audio",), turn_id=0)))
+        tokens.extend([DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end])
+        list(plane.project(_result(tokens), context=DuplexDataPlaneContext(modalities=("audio",), turn_id=0)))
+
+    def audio(turn: int) -> list[dict[str, object]]:
+        output = SimpleNamespace(
+            request_id="req", stage_id=2, outputs=[SimpleNamespace()], multimodal_output={"audio": [torch.zeros(4)]}
+        )
+        return list(
+            plane.project(
+                {"data_plane_outputs": [output]},
+                context=DuplexDataPlaneContext(modalities=("audio",), active_response_turn_id=turn),
+            )
+        )
+
+    assert [event["text"] for event in audio(0)] == [""]
+    assert [event["text"] for event in audio(1)] == ["one", ""]
+    assert [event["text"] for event in audio(2)] == ["two", ""]
+
+
 def test_the_window_is_tagged_with_the_session_model_turn() -> None:
     # The context is a dataclass, not a mapping. Reading it as a mapping tagged
     # every window with turn 0, and the session dropped each model turn after

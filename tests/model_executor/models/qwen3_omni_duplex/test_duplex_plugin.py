@@ -105,7 +105,7 @@ def _stage_output(token_ids: tuple[int, ...]) -> SimpleNamespace:
     # DELTA output: the step reports one token, the window lives in the
     # cumulative history the Omni output processor attaches.
     completion = SimpleNamespace(token_ids=token_ids[-1:], cumulative_token_ids=token_ids)
-    return SimpleNamespace(outputs=[completion])
+    return SimpleNamespace(request_id="req", outputs=[completion])
 
 
 def test_decide_output_closes_listen_and_speak_on_this_stage() -> None:
@@ -180,15 +180,15 @@ def test_text_only_speak_turn_is_not_forwarded_and_stays_locked() -> None:
 
     assert first is not None and first.metadata["duplex_native_decision"] == "speak"
     assert second is not None and second.metadata["duplex_native_decision"] == "speak"
-    assert plugin._speak_turn_modalities == ("text",)
+    assert plugin._speak_turn_modalities.get("req") == ("text",)
     # A different set is dropped. The same set in another order is kept.
     changed = DuplexSessionConfig(modalities=["text", "audio"], temperature=0.2)
-    assert plugin.runtime_config_for_update(changed, {"instructions": None})["instructions"] == DEFAULT_INSTRUCTIONS
+    assert plugin.runtime_config_for_update(changed, {"instructions": None, "duplex_session_key": "req"})["instructions"] == DEFAULT_INSTRUCTIONS
     assert changed.modalities == ["text"]
     assert changed.temperature == 0.2
     reordered = DuplexSessionConfig(modalities=["audio", "text"])
-    plugin._speak_turn_modalities = ("text", "audio")
-    plugin.runtime_config_for_update(reordered, {"instructions": DEFAULT_INSTRUCTIONS})
+    plugin._speak_turn_modalities["req"] = ("text", "audio")
+    plugin.runtime_config_for_update(reordered, {"instructions": DEFAULT_INSTRUCTIONS, "duplex_session_key": "req"})
     assert reordered.modalities == ["audio", "text"]
 
 
@@ -199,13 +199,13 @@ def test_speak_turn_lock_clears_on_turn_eos_and_the_next_turn_can_enable_audio()
 
     closed = _decide(plugin, ending, modalities=("text",))
     assert closed is not None
-    assert plugin._speak_turn_modalities is None
-    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["audio"]), {"instructions": None})[
+    assert not plugin._speak_turn_modalities
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(modalities=["audio"]), {"instructions": None, "duplex_session_key": "req"})[
         "instructions"
     ] == DEFAULT_INSTRUCTIONS
     forwarded = _decide(plugin, nxt, modalities=("text", "audio"))
     assert forwarded is None
-    assert plugin._speak_turn_modalities == ("text", "audio")
+    assert plugin._speak_turn_modalities.get("req") == ("text", "audio")
 
 
 def test_listen_window_does_not_open_or_clear_the_speak_turn_lock() -> None:
@@ -213,13 +213,62 @@ def test_listen_window_does_not_open_or_clear_the_speak_turn_lock() -> None:
     listen = (DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)
 
     assert _decide(plugin, listen, modalities=("text",)) is not None
-    assert plugin._speak_turn_modalities is None
+    assert not plugin._speak_turn_modalities
 
     speak = (DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)
     assert _decide(plugin, speak, modalities=("text", "audio")) is None
     mid_listen = (*speak, DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end)
     assert _decide(plugin, mid_listen, modalities=("text",)) is not None
-    assert plugin._speak_turn_modalities == ("text", "audio")
+    assert plugin._speak_turn_modalities.get("req") == ("text", "audio")
+
+
+def test_interleaved_sessions_keep_turn_modalities_and_instructions_separate() -> None:
+    from vllm_omni.engine.duplex.contracts import duplex_resource_request_id
+
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: None)
+    speak = (DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.unit_end)
+    ending = (*speak, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end)
+    requests = [duplex_resource_request_id(DuplexFence(session_id=name), "stage0") for name in ("one", "two")]
+    for request_id, key in zip(requests, ("key-one", "key-two")):
+        plugin._request_session_keys[request_id] = key
+        plugin._submitted_prefix[request_id] = _DEFAULT_PREFIX
+
+    def decide(request_id: str, tokens: tuple[int, ...], modalities: tuple[str, ...]) -> object:
+        plugin.output_modalities = modalities
+        output = _stage_output(tokens)
+        output.request_id = request_id
+        return plugin.decide_output(
+            stage_id=0, final_stage_id=2, segment_finished=True,
+            segment_token_ids=tokens[-1:], segment_output_metadata={}, output=output,
+        )
+
+    assert decide(requests[0], speak, ("text",)) is not None
+    assert decide(requests[1], speak, ("text", "audio")) is None
+    assert plugin._speak_turn_modalities == {"key-one": ("text",), "key-two": ("text", "audio")}
+    updated = DuplexSessionConfig(modalities=["audio"])
+    plugin.runtime_config_for_update(updated, {"instructions": None, "duplex_session_key": "key-one"})
+    assert updated.modalities == ["text"]
+    updated = DuplexSessionConfig(modalities=["text"])
+    plugin.runtime_config_for_update(updated, {"instructions": None, "duplex_session_key": "key-two"})
+    assert updated.modalities == ["text", "audio"]
+    plugin._submitted_prefix.pop(requests[1])
+    plugin._encode_system_prefix = lambda _model, _instructions: (101, 102)
+    changed = DuplexSessionConfig(instructions="new prompt")
+    runtime = plugin.runtime_config_for_update(
+        changed, {"instructions": None, "duplex_session_key": "key-two"}
+    )
+    assert changed.instructions == "new prompt"
+    assert runtime["system_prefix_token_ids"] == [101, 102]
+    locked = DuplexSessionConfig(instructions="new prompt")
+    plugin.runtime_config_for_update(locked, {"instructions": None, "duplex_session_key": "key-one"})
+    assert locked.instructions == DEFAULT_INSTRUCTIONS
+    plugin._submitted_prefix[requests[1]] = _DEFAULT_PREFIX
+    assert decide(requests[0], ending, ("text",)) is not None
+    assert decide(requests[1], speak, ("text", "audio")) is None
+    plugin.data_plane.close_session("one")
+    assert requests[0] not in plugin._submitted_prefix
+    assert requests[1] in plugin._submitted_prefix
+    assert plugin._speak_turn_modalities == {"key-two": ("text", "audio")}
 
 
 def test_capabilities_are_resumable_and_audio_only() -> None:
