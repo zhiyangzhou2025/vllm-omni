@@ -1494,6 +1494,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
+        self._ack_duplex_history_trims(scheduler_output)
+        return engine_core_outputs
+
+    def _ack_duplex_history_trims(self, scheduler_output: SchedulerOutput) -> None:
         for req_id, (held_blocks, expected_computed, _) in list(
             getattr(self, "_duplex_history_trim_pending", {}).items()
         ):
@@ -1505,8 +1509,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.kv_cache_manager.block_pool.free_blocks(reversed(held_blocks))
                 self._duplex_history_trim_pending.pop(req_id, None)
                 logger.info("Duplex history trim ack request=%s released_blocks=%s", req_id, len(held_blocks))
-
-        return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """Apply the next streaming update to a persistent session.
@@ -1728,8 +1730,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if "Qwen3OmniDuplexForConditionalGeneration" not in architectures:
             return None
         if getattr(self.vllm_config.scheduler_config, "async_scheduling", False):
-            return None
-        if not getattr(model_config, "enforce_eager", False):
             return None
         if self.kv_cache_manager.enable_caching or session.mm_features or session.block_hashes:
             return None

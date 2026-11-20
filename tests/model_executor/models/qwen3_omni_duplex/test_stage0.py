@@ -140,7 +140,10 @@ def test_thinker2talker_accepts_owner_compacted_windows_and_prompt() -> None:
 
 
 @pytest.mark.parametrize("remaining_capacity", [1, AUDIO_WINDOW_PROMPT_TOKENS + 31])
-def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(remaining_capacity: int) -> None:
+@pytest.mark.parametrize("enforce_eager,async_scheduling", [(True, False), (False, False), (False, True)])
+def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(
+    remaining_capacity: int, enforce_eager: bool, async_scheduling: bool
+) -> None:
     prefix = [42] * 9
     prompt = prefix + sum((_window() for _ in range(120)), [])
     config = KVCacheConfig(
@@ -152,7 +155,9 @@ def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(remaining_
             )
         ],
     )
-    manager = KVCacheManager(config, max_model_len=2048, scheduler_block_size=16, hash_block_size=16, enable_caching=False)
+    manager = KVCacheManager(
+        config, max_model_len=2048, scheduler_block_size=16, hash_block_size=16, enable_caching=False
+    )
     requests = [Request(f"duplex-trim-{i}", prompt.copy(), SamplingParams(max_tokens=32), None) for i in range(2)]
     for request in requests:
         assert manager.allocate_slots(request, num_new_tokens=len(prompt)) is not None
@@ -164,9 +169,9 @@ def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(remaining_
         model_config=SimpleNamespace(
             architectures=["Qwen3OmniDuplexForConditionalGeneration"],
             max_model_len=len(prompt) + remaining_capacity,
-            enforce_eager=True,
+            enforce_eager=enforce_eager,
         ),
-        scheduler_config=SimpleNamespace(async_scheduling=False),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
     )
     other_before = manager.get_block_ids(requests[1].request_id)[0]
     update = SimpleNamespace(
@@ -177,6 +182,14 @@ def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(remaining_
     )
 
     trim = scheduler._trim_qwen3_omni_duplex_history(requests[0], update)
+
+    if async_scheduling:
+        assert trim is None
+        assert requests[0].prompt_token_ids == prompt
+        assert manager.get_block_ids(requests[1].request_id)[0] == other_before
+        for request in requests:
+            manager.free(request)
+        return
 
     assert trim is not None
     held = trim["held_blocks"]
@@ -190,9 +203,20 @@ def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(remaining_
         <= scheduler.vllm_config.model_config.max_model_len
     )
     scheduler._duplex_history_trim_pending[requests[0].request_id] = (held, requests[0].num_computed_tokens, 0)
+    req_id = requests[0].request_id
+    computed = requests[0].num_computed_tokens
+    scheduled = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id=req_id, num_computed_tokens=computed - 1)],
+        num_scheduled_tokens={req_id: 1},
+    )
+    scheduler._ack_duplex_history_trims(scheduled)
+    assert req_id in scheduler._duplex_history_trim_pending
     assert all(block.ref_cnt == 1 for block in held)
-    manager.block_pool.free_blocks(reversed(held))
+    scheduled.scheduled_new_reqs[0].num_computed_tokens = computed
+    scheduler._ack_duplex_history_trims(scheduled)
+    assert req_id not in scheduler._duplex_history_trim_pending
     assert all(block.ref_cnt == 0 for block in held)
+    assert manager.get_block_ids(requests[1].request_id)[0] == other_before
     for request in requests:
         manager.free(request)
 
