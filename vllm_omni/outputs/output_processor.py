@@ -22,6 +22,7 @@ from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
@@ -144,6 +145,9 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        self._duplex_trimmed_tokens = 0
+        self._duplex_trim_prefix_rows = 0
+        self._duplex_compacted_windows = 0
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -159,6 +163,7 @@ class OmniRequestState(RequestState):
         """
         if payload is None:
             return
+        trim_tokens = None
         try:
             if mm_type:
                 self.mm_type = mm_type.lower()
@@ -166,10 +171,60 @@ class OmniRequestState(RequestState):
 
             incoming = MultimodalPayload.from_raw(payload, modality_key)
             if incoming is not None:
-                replace_snapshot_keys(self.mm_accumulated, incoming)
-                replace_nemotron_snapshot_keys(self.mm_accumulated, incoming)
-                self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
+                trim_tokens = incoming.tensors.pop("duplex_trimmed_tokens", None)
+                trim_windows = incoming.tensors.pop("duplex_trimmed_windows", None)
+                trim_prefix_rows = incoming.tensors.pop("duplex_trim_prefix_rows", None)
+                if trim_tokens is not None:
+                    incoming.metadata["duplex_trimmed_tokens"] = trim_tokens
+                if trim_windows is not None:
+                    incoming.metadata["duplex_trimmed_windows"] = trim_windows
+                if trim_prefix_rows is not None:
+                    incoming.metadata["duplex_trim_prefix_rows"] = trim_prefix_rows
+                accumulated = self.mm_accumulated
+                if trim_tokens is not None:
+                    accumulated = MultimodalPayload(
+                        tensors={k: list(v) if isinstance(v, list) else v for k, v in accumulated.tensors.items()},
+                        metadata=dict(accumulated.metadata),
+                    )
+                replace_snapshot_keys(accumulated, incoming)
+                replace_nemotron_snapshot_keys(accumulated, incoming)
+                accumulated = accumulated.merged_with(incoming)
+                if trim_tokens is not None:
+                    cumulative_trim = int(trim_tokens.reshape(-1)[-1].item())
+                    trim_delta = cumulative_trim - self._duplex_trimmed_tokens
+                    if trim_delta < 0:
+                        raise ValueError("Qwen3-Omni-Duplex trim marker moved backwards")
+                    if trim_delta:
+                        if trim_prefix_rows is None:
+                            raise ValueError("Qwen3-Omni-Duplex trim marker is missing its system-prefix row count")
+                        prefix_rows = int(trim_prefix_rows.reshape(-1)[-1].item())
+                        if prefix_rows < 0:
+                            raise ValueError("Qwen3-Omni-Duplex trim prefix row count cannot be negative")
+                        hidden_rows = {
+                            key: torch.cat(value, dim=0) if isinstance(value, list) else value
+                            for key, value in accumulated.tensors.items()
+                            if key.startswith("hidden_states.layer_")
+                        }
+                        if not hidden_rows:
+                            raise ValueError("Qwen3-Omni-Duplex trim has no accumulated Thinker rows")
+                        if any(rows.shape[0] < prefix_rows + trim_delta for rows in hidden_rows.values()):
+                            raise ValueError("Qwen3-Omni-Duplex trim exceeds accumulated Thinker rows")
+                        for key, rows in hidden_rows.items():
+                            accumulated.tensors[key] = torch.cat(
+                                (rows[:prefix_rows], rows[prefix_rows + trim_delta :]), dim=0
+                            )
+                        self._duplex_trimmed_tokens = cumulative_trim
+                        self._duplex_trim_prefix_rows = prefix_rows
+                        logger.info(
+                            "Duplex hidden history trim request=%s removed_rows=%s retained_rows=%s",
+                            self.request_id,
+                            trim_delta,
+                            next(iter(hidden_rows.values())).shape[0] - trim_delta,
+                        )
+                self.mm_accumulated = accumulated
         except (ValueError, TypeError, RuntimeError):
+            if trim_tokens is not None:
+                raise
             logger.exception("Error accumulating multimodal tensor")
 
     def _consolidate_multimodal_tensors(self) -> None:
@@ -297,6 +352,53 @@ class OmniRequestState(RequestState):
             ec_transfer_params,
         )
 
+    def _compact_duplex_token_history(self, output: CompletionOutput) -> None:
+        marker = self.mm_accumulated.get("duplex_trimmed_windows")
+        if marker is None or self.detokenizer is None:
+            return
+        trimmed_windows = int(marker.reshape(-1)[-1].item())
+        pending = trimmed_windows - self._duplex_compacted_windows
+        if pending < 0:
+            raise ValueError("Qwen3-Omni-Duplex window trim marker moved backwards")
+        if not pending:
+            return
+        detokenizer = self.detokenizer
+        if getattr(detokenizer, "stop", ()) or getattr(detokenizer, "min_tokens", 0):
+            raise ValueError("Qwen3-Omni-Duplex history trim does not support text stop strings or min_tokens")
+        output_ids = list(output.cumulative_token_ids)
+        closed = 0
+        remove_ids = 0
+        for i, token_id in enumerate(output_ids):
+            if token_id == DUPLEX_TOKENS.unit_end:
+                closed += 1
+                if closed == pending:
+                    remove_ids = i + 1
+                    break
+        prefix_rows = self._duplex_trim_prefix_rows
+        prompt_ids = self.prompt_token_ids
+        if closed < pending or prompt_ids is None or len(prompt_ids) < prefix_rows + pending * 10:
+            raise ValueError("Qwen3-Omni-Duplex trim exceeds output token or prompt history")
+        self.prompt_token_ids = prompt_ids[:prefix_rows] + prompt_ids[prefix_rows + pending * 10 :]
+        self.prompt_len = len(self.prompt_token_ids)
+        prompt_len = getattr(detokenizer, "prompt_len", 0)
+        del detokenizer.token_ids[prompt_len : prompt_len + remove_ids]
+        if hasattr(detokenizer, "tokens"):
+            cut = max(0, min(detokenizer.prefix_offset, detokenizer.read_offset) - 8)
+            del detokenizer.tokens[:cut]
+            detokenizer.prefix_offset -= cut
+            detokenizer.read_offset -= cut
+        if self.output_kind == RequestOutputKind.DELTA:
+            self.sent_tokens_offset = max(0, self.sent_tokens_offset - remove_ids)
+        self._duplex_compacted_windows = trimmed_windows
+        output.cumulative_token_ids = output_ids[remove_ids:]
+        logger.info(
+            "Duplex output history trim request=%s removed_windows=%s retained_prompt=%s retained_output=%s",
+            self.request_id,
+            pending,
+            len(self.prompt_token_ids),
+            len(detokenizer.output_token_ids),
+        )
+
     def _new_completion_output(
         self,
         token_ids: list[int],
@@ -337,6 +439,12 @@ class OmniRequestState(RequestState):
         # Attach cumulative_text only at the final step for inter-stage use.
         if finish_reason is not None and hasattr(self.detokenizer, "output_text"):
             base_output.cumulative_text = self.detokenizer.output_text
+
+        self._compact_duplex_token_history(base_output)
+        if self._duplex_compacted_windows:
+            self.mm_accumulated.metadata["duplex_history_window_base"] = torch.tensor(
+                [self._duplex_compacted_windows], dtype=torch.int64
+            )
 
         try:
             if self.mm_accumulated and not self.mm_accumulated.is_empty:

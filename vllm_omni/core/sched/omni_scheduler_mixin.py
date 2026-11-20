@@ -854,6 +854,24 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         request: Request,
         **output_fields: Any,
     ) -> None:
+        trimmed_tokens = int(getattr(request, "_duplex_trimmed_tokens", 0) or 0)
+        multimodal_output = output_fields.get("multimodal_output")
+        if trimmed_tokens and multimodal_output is not None:
+            markers = {
+                "duplex_trimmed_tokens": torch.tensor([trimmed_tokens], dtype=torch.int64),
+                "duplex_trimmed_windows": torch.tensor(
+                    [int(request._duplex_trimmed_windows)], dtype=torch.int64
+                ),
+                "duplex_trim_prefix_rows": torch.tensor(
+                    [int(request._duplex_trim_prefix_rows)], dtype=torch.int64
+                ),
+            }
+            if isinstance(multimodal_output, dict):
+                multimodal_output.update(markers)
+            elif isinstance(getattr(multimodal_output, "tensors", None), dict):
+                multimodal_output.tensors.update(markers)
+            else:
+                raise ValueError("Qwen3-Omni-Duplex history trim requires a multimodal output payload")
         outputs[request.client_index].append(
             OmniSchedulerMixin._make_omni_engine_output(
                 self,

@@ -107,6 +107,40 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             return
         self.post_sample_talker_mtp = None
 
+    def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
+        """Copy the retained Stage 0 tail into its prefix page before forward."""
+        if self.model_stage != "thinker" or scheduler_output is None:
+            return
+        for new_request in scheduler_output.scheduled_new_reqs:
+            req_id = new_request.req_id
+            model_buffer = getattr(new_request, "model_intermediate_buffer", None)
+            duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+            trim = duplex.get("history_trim") if isinstance(duplex, dict) else None
+            if not isinstance(trim, dict):
+                continue
+            req_state = runner.requests[req_id]
+            mrope_positions = getattr(req_state, "mrope_positions", None)
+            if mrope_positions is None or mrope_positions.shape[1] != req_state.num_prompt_tokens:
+                raise ValueError("Qwen3-Omni-Duplex history trim requires complete MRoPE prompt positions")
+            prefix_tokens = int(trim["prefix_tokens"])
+            cumulative_trim = int(trim["trimmed_tokens"])
+            if req_state.mrope_position_delta != 0:
+                raise ValueError("Qwen3-Omni-Duplex history trim expected freshly initialized MRoPE positions")
+            if "source_block_id" in trim:
+                block_size = int(trim["block_size"])
+                if not runner.kv_caches or any(
+                    cache.ndim != 4 or cache.shape[2] != block_size for cache in runner.kv_caches
+                ):
+                    raise ValueError("Qwen3-Omni-Duplex history trim requires uniform full-attention KV page layout")
+                source = int(trim["source_block_id"])
+                target = int(trim["prefix_block_id"])
+                for cache in runner.kv_caches:
+                    cache[target, :, prefix_tokens:block_size, :].copy_(cache[source, :, prefix_tokens:block_size, :])
+                trim.pop("source_block_id")
+                trim.pop("prefix_block_id")
+            mrope_positions[:, prefix_tokens:] += cumulative_trim
+            req_state.mrope_position_delta = cumulative_trim
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream the checkpoint with the code predictor's subtree kept whole.
 

@@ -157,6 +157,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # completes so that kv_ready can be emitted while the request is still
         # alive.  Stopped on the first scheduler step after extraction ack.
         self.pending_stop_after_extraction: set[str] = set()
+        self._duplex_history_trim_pending: dict[str, tuple[list[Any], int, int]] = {}
 
         self.finished_req_ids_dict = defaultdict(set)
 
@@ -215,6 +216,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _free_request_blocks(self, request: Request) -> None:
         """Keep native Mooncake pages coalescible without changing vLLM APIs."""
+        pending_trim = self._duplex_history_trim_pending.get(request.request_id)
+        if pending_trim is not None and not request.num_in_flight_tokens:
+            self.kv_cache_manager.block_pool.free_blocks(reversed(pending_trim[0]))
+            del self._duplex_history_trim_pending[request.request_id]
 
         if not self._uses_native_mooncake_connector() or self.kv_cache_manager.enable_caching:
             super()._free_request_blocks(request)
@@ -1226,6 +1231,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                if (
+                    getattr(self.vllm_config.model_config, "stage_id", None) == 0
+                    and getattr(request, "_duplex_trimmed_tokens", 0)
+                    and (not new_token_ids or new_token_ids[-1] not in request.sampling_params.stop_token_ids)
+                ):
+                    logger.warning(
+                        "Duplex non-unit-end stop request=%s reason=%s stop_reason=%s new_ids=%s "
+                        "generated_tail=%s computed=%s prompt=%s in_flight=%s",
+                        req_id,
+                        finish_reason,
+                        request.stop_reason,
+                        new_token_ids,
+                        request._all_token_ids[-12:],
+                        request.num_computed_tokens,
+                        request.num_prompt_tokens,
+                        request.num_in_flight_tokens,
+                    )
                 if self.chunk_transfer_adapter is not None:
                     try:
                         boundary_generation = int(getattr(request, "_omni_segment_generation", 0) or 0)
@@ -1472,6 +1494,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 except Exception:
                     init_logger(__name__).exception("Failed to free blocks for %s after transfer", req_id)
 
+        for req_id, (held_blocks, expected_computed, _) in list(
+            getattr(self, "_duplex_history_trim_pending", {}).items()
+        ):
+            acknowledged = any(
+                item.req_id == req_id and item.num_computed_tokens == expected_computed
+                for item in scheduler_output.scheduled_new_reqs
+            )
+            if acknowledged and scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0:
+                self.kv_cache_manager.block_pool.free_blocks(reversed(held_blocks))
+                self._duplex_history_trim_pending.pop(req_id, None)
+                logger.info("Duplex history trim ack request=%s released_blocks=%s", req_id, len(held_blocks))
+
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
@@ -1654,12 +1688,144 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        trim = self._trim_qwen3_omni_duplex_history(session, update) if stage_id == 0 else None
         if self._streaming_update_overflows(session, update):
             return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+        if trim is None and int(getattr(session, "_duplex_trimmed_tokens", 0)):
+            info = session.model_intermediate_buffer
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            if isinstance(duplex, dict):
+                info = dict(info)
+                info["duplex"] = {
+                    **duplex,
+                    "history_trim": {
+                        "prefix_tokens": session._duplex_trim_prefix_rows,
+                        "trimmed_tokens": session._duplex_trimmed_tokens,
+                    },
+                }
+                session.model_intermediate_buffer = info
+        if trim is not None:
+            self._duplex_history_trim_pending[req_id] = (
+                trim["held_blocks"],
+                session.num_computed_tokens,
+                session.num_prompt_tokens,
+            )
+
+    def _trim_qwen3_omni_duplex_history(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+    ) -> dict[str, Any] | None:
+        """Compact a supported synchronous Stage 0 duplex prompt before overflow."""
+        from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import plan_history_trim
+
+        model_config = self.vllm_config.model_config
+        architectures = getattr(model_config, "architectures", ()) or ()
+        if "Qwen3OmniDuplexForConditionalGeneration" not in architectures:
+            return None
+        if getattr(self.vllm_config.scheduler_config, "async_scheduling", False):
+            return None
+        if not getattr(model_config, "enforce_eager", False):
+            return None
+        if self.kv_cache_manager.enable_caching or session.mm_features or session.block_hashes:
+            return None
+        if session.num_in_flight_tokens or session.num_output_placeholders:
+            return None
+        if session.num_computed_tokens < session.num_prompt_tokens:
+            return None
+        prompt_ids = session.prompt_token_ids
+        if (
+            len(prompt_ids) != session.num_prompt_tokens
+            or prompt_ids != session._all_token_ids[: session.num_prompt_tokens]
+        ):
+            return None
+
+        model_buffer = getattr(update, "model_intermediate_buffer", None)
+        duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            model_buffer = getattr(session, "model_intermediate_buffer", None)
+            duplex = model_buffer.get("duplex") if isinstance(model_buffer, dict) else None
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        runtime_config = duplex.get("runtime_config")
+        if not isinstance(runtime_config, dict):
+            return None
+        prefix_ids = runtime_config.get("system_prefix_token_ids")
+        if not isinstance(prefix_ids, (list, tuple)) or not prefix_ids:
+            return None
+        prefix_tokens = len(prefix_ids)
+        if prompt_ids[:prefix_tokens] != list(prefix_ids):
+            return None
+
+        next_len = max(session.num_prompt_tokens, session.num_computed_tokens) + len(update.prompt_token_ids)
+        sample_room = int(session.sampling_params.max_tokens)
+        required_tokens = next_len + sample_room - model_config.max_model_len
+        if required_tokens <= 0:
+            return None
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != 1:
+            return None
+        group = managers[0]
+        block_size = int(group.block_size)
+        if type(group.kv_cache_spec).__name__ != "FullAttentionSpec" or not 0 < prefix_tokens < block_size:
+            return None
+        if session.request_id in self._duplex_history_trim_pending:
+            return None
+        plan = plan_history_trim(
+            prompt_ids,
+            prefix_tokens=prefix_tokens,
+            block_size=block_size,
+            required_tokens=required_tokens,
+            target_tokens=max(required_tokens, model_config.max_model_len // 4),
+            max_removed_tokens=len(prompt_ids) - prefix_tokens - 2 * block_size,
+        )
+        if plan is None:
+            return None
+
+        blocks = list(group.req_to_blocks.get(session.request_id, ()))
+        tail_start = prefix_tokens + plan.removed_tokens
+        source_index = tail_start // block_size
+        if source_index <= 0 or source_index + 1 >= len(blocks):
+            return None
+        if len({block.block_id for block in blocks}) != len(blocks) or any(block.ref_cnt != 1 for block in blocks):
+            return None
+        retained = [blocks[0], *blocks[source_index + 1 :]]
+        held = blocks[1 : source_index + 1]
+        if not retained or not held:
+            return None
+
+        group.req_to_blocks[session.request_id] = retained
+        del session.prompt_token_ids[prefix_tokens:tail_start]
+        del session._all_token_ids[prefix_tokens:tail_start]
+        session.num_prompt_tokens -= plan.removed_tokens
+        session.num_computed_tokens -= plan.removed_tokens
+        session.block_hashes.clear()
+        group.num_cached_block.pop(session.request_id, None)
+
+        session._duplex_trimmed_tokens = int(getattr(session, "_duplex_trimmed_tokens", 0)) + plan.removed_tokens
+        session._duplex_trimmed_windows = int(getattr(session, "_duplex_trimmed_windows", 0)) + plan.removed_windows
+        session._duplex_trim_prefix_rows = prefix_tokens
+        duplex["history_trim"] = {
+            "source_block_id": int(blocks[source_index].block_id),
+            "prefix_block_id": int(blocks[0].block_id),
+            "block_size": block_size,
+            "prefix_tokens": prefix_tokens,
+            "trimmed_tokens": session._duplex_trimmed_tokens,
+        }
+        update.model_intermediate_buffer = model_buffer
+        logger.info(
+            "Duplex history trim request=%s removed_tokens=%s removed_windows=%s retained_tokens=%s held_blocks=%s",
+            session.request_id,
+            plan.removed_tokens,
+            plan.removed_windows,
+            session.num_prompt_tokens,
+            len(held),
+        )
+        return {"held_blocks": held}
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
         """Delegate streaming prompt policy to the stage's payload processor."""

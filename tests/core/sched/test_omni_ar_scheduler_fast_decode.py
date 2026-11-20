@@ -24,7 +24,7 @@ EOS = 99
 AUDIO = torch.arange(6, dtype=torch.float32)
 
 
-def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNamespace]:
+def _run(spec_decode_tokens: dict, *, trim_ack: bool | None = None) -> tuple[list, dict[str, _Request], SimpleNamespace]:
     requests = [_Request(f"r{i}") for i in range(4)]
     for request in requests:
         request.sampling_params = SimpleNamespace(num_logprobs=None)
@@ -35,6 +35,13 @@ def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNam
     requests[3].drop_stale_output = True
     scheduler = _make_scheduler_stub(requests)
     calls: list[str] = []
+    released: list[object] = []
+    if trim_ack is not None:
+        held = object()
+        scheduler._duplex_history_trim_pending = {"r0": ([held], 10, 0)}
+        scheduler.kv_cache_manager.block_pool = SimpleNamespace(
+            free_blocks=lambda blocks: released.extend(blocks)
+        )
 
     def update_request(request, token_ids):
         calls.append(request.request_id)
@@ -48,6 +55,11 @@ def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNam
         num_scheduled_tokens={request.request_id: 1 for request in requests},
         scheduled_spec_decode_tokens=spec_decode_tokens,
         num_invalid_spec_tokens=0,
+        scheduled_new_reqs=(
+            [SimpleNamespace(req_id="r0", num_computed_tokens=10 if trim_ack else 9)]
+            if trim_ack is not None
+            else []
+        ),
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[5], [EOS], [6], [7]],
@@ -65,7 +77,7 @@ def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNam
     return (
         list(outputs[0].outputs),
         {request.request_id: request for request in requests},
-        SimpleNamespace(scheduler=scheduler, calls=calls),
+        SimpleNamespace(scheduler=scheduler, calls=calls, released=released),
     )
 
 
@@ -86,6 +98,16 @@ def _fields(output) -> tuple:
         output.pooling_output_payload,
         None if output.multimodal_output is None else {k: id(v) for k, v in output.multimodal_output.items()},
     )
+
+
+def test_duplex_trim_holds_pages_until_matching_worker_step_returns() -> None:
+    _, _, before_ack = _run({}, trim_ack=False)
+    assert before_ack.released == []
+    assert "r0" in before_ack.scheduler._duplex_history_trim_pending
+
+    _, _, after_ack = _run({}, trim_ack=True)
+    assert len(after_ack.released) == 1
+    assert after_ack.scheduler._duplex_history_trim_pending == {}
 
 
 def test_fast_decode_matches_the_general_path():

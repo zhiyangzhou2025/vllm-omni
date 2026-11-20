@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
@@ -19,6 +20,60 @@ AUDIO_TOKENS_PER_UNIT = 6
 AUDIO_BOUNDARY_TOKENS = 2
 UNIT_START_TOKENS = 1
 AUDIO_WINDOW_PROMPT_TOKENS = UNIT_START_TOKENS + AUDIO_BOUNDARY_TOKENS + AUDIO_TOKENS_PER_UNIT
+
+
+@dataclass(frozen=True)
+class HistoryTrimPlan:
+    prefix_tokens: int
+    removed_tokens: int
+    removed_windows: int
+
+
+def plan_history_trim(
+    token_ids: Sequence[int],
+    *,
+    prefix_tokens: int,
+    block_size: int,
+    required_tokens: int,
+    target_tokens: int,
+    max_removed_tokens: int | None = None,
+) -> HistoryTrimPlan | None:
+    """Select a page-aligned prefix of complete, closed speaking-turn groups."""
+    if prefix_tokens < 0 or prefix_tokens > len(token_ids) or block_size <= 0:
+        raise ValueError("Invalid Qwen3-Omni-Duplex history prefix or block size")
+    if required_tokens <= 0:
+        return None
+    cursor = prefix_tokens
+    windows = 0
+    speaking = False
+    candidates: list[HistoryTrimPlan] = []
+    while cursor < len(token_ids):
+        end_prompt = cursor + AUDIO_WINDOW_PROMPT_TOKENS
+        if list(token_ids[cursor:end_prompt]) != [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS:
+            raise ValueError("Malformed Qwen3-Omni-Duplex history window prompt")
+        cursor = end_prompt
+        while cursor < len(token_ids) and token_ids[cursor] != DUPLEX_TOKENS.unit_end:
+            if token_ids[cursor] == DUPLEX_TOKENS.speak:
+                speaking = True
+            elif token_ids[cursor] == DUPLEX_TOKENS.turn_eos:
+                if not speaking:
+                    raise ValueError("Qwen3-Omni-Duplex history closes an unopened speaking turn")
+                speaking = False
+            cursor += 1
+        if cursor == len(token_ids):
+            break
+        cursor += 1
+        windows += 1
+        removed = cursor - prefix_tokens
+        if (
+            not speaking
+            and removed % block_size == 0
+            and removed >= required_tokens
+            and (max_removed_tokens is None or removed <= max_removed_tokens)
+            and cursor < len(token_ids)
+        ):
+            candidates.append(HistoryTrimPlan(prefix_tokens, removed, windows))
+    return min(candidates, key=lambda plan: abs(plan.removed_tokens - target_tokens), default=None)
 
 
 def build_audio_window_prompt(

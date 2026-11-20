@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import BOOTSTRAP_ROWS
@@ -54,6 +55,7 @@ _EMBED_LAYER = 0
 _HIDDEN_LAYER = 24
 _CODEC_GROUPS = 16
 _BRIDGE_KEY = "qwen3_omni_duplex_talker"
+logger = init_logger(__name__)
 
 
 def _windows(token_ids: list[int]) -> list[list[int]]:
@@ -129,7 +131,25 @@ def thinker2talker(
         multimodal = getattr(output, "multimodal_output", None)
         if multimodal is None and completion is not None:
             multimodal = getattr(completion, "multimodal_output", None)
-        windows = _windows(list(getattr(completion, "cumulative_token_ids", ()) or ()))
+        token_ids = list(getattr(completion, "cumulative_token_ids", ()) or ())
+        if token_ids and token_ids[-1] != DUPLEX_TOKENS.unit_end:
+            logger.warning(
+                "Duplex forwarded open window req=%s output_finished=%s finish_reason=%s stop_reason=%s "
+                "tail=%s prompt_len=%s",
+                getattr(output, "request_id", None),
+                getattr(output, "finished", None),
+                getattr(completion, "finish_reason", None),
+                getattr(completion, "stop_reason", None),
+                token_ids[-16:],
+                len(getattr(output, "prompt_token_ids", ()) or ()),
+            )
+        all_windows = _windows(token_ids)
+        trimmed_marker = multimodal.get("duplex_trimmed_windows", torch.tensor([0]))
+        base_marker = multimodal.get("duplex_history_window_base", torch.tensor([0]))
+        trimmed_windows = int(trimmed_marker.reshape(-1)[-1].item()) - int(base_marker.reshape(-1)[-1].item())
+        if trimmed_windows < 0 or trimmed_windows >= len(all_windows):
+            raise ValueError("Qwen3-Omni-Duplex trim must retain the current window")
+        windows = all_windows[trimmed_windows:]
         window = windows[-1]
         if window[0] != DUPLEX_TOKENS.speak:
             raise ValueError(f"Qwen3-Omni-Duplex forwarded a window that does not open with <|speak|>: {window}")
@@ -150,10 +170,15 @@ def thinker2talker(
         # The session's next append can reach the Thinker before this window is
         # forwarded, so the prompt may already hold rows the hidden states do not
         # cover. Those belong to the next window.
-        prompt_ids = list(getattr(output, "prompt_token_ids", None) or ())[: len(context_idx)]
+        prompt_source = list(getattr(output, "prompt_token_ids", None) or ())
+        if trimmed_windows:
+            prompt_source = prompt_source[:prefix_len] + prompt_source[prefix_len + trimmed_windows * 10 :]
+            output.prompt_token_ids = prompt_source
+        prompt_ids = prompt_source[: len(context_idx)]
         if len(prompt_ids) != len(context_idx):
             raise ValueError(
-                f"Qwen3-Omni-Duplex Thinker prompt has {len(prompt_ids)} rows, the window layout needs {len(context_idx)}"
+                f"Qwen3-Omni-Duplex Thinker prompt has {len(prompt_ids)} rows, "
+                f"the window layout needs {len(context_idx)}"
             )
         generated_ids = window[:-1]
         generated_t = torch.tensor(generated_idx, dtype=torch.long)

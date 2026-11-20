@@ -14,7 +14,7 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
-from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.detokenizer import FastIncrementalDetokenizer, IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.metrics.stats import (
@@ -386,6 +386,202 @@ def test_cumulative_emits_consolidated_audio_each_step():
     assert isinstance(audio2, torch.Tensor) and cons_audio.shape == (1, total_audio_len)
 
     assert "audio" in s.mm_accumulated
+
+
+def test_duplex_trim_compacts_request_scoped_hidden_history() -> None:
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(13).reshape(13, 1),
+            "duplex_trimmed_tokens": torch.tensor([4]),
+            "duplex_trim_prefix_rows": torch.tensor([3]),
+            "duplex_trimmed_windows": torch.tensor([2]),
+        },
+        mm_type=LATENT,
+    )
+
+    hidden = state.mm_accumulated.tensors["hidden_states.layer_0"]
+    assert isinstance(hidden, torch.Tensor)
+    assert hidden[:, 0].tolist() == [0, 1, 2, 7, 8, 9, 10, 11, 12]
+    assert state.mm_accumulated.get("duplex_trimmed_windows").tolist() == [2]
+
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.tensor([[13], [14]]),
+            "duplex_trimmed_tokens": torch.tensor([6]),
+            "duplex_trim_prefix_rows": torch.tensor([3]),
+            "duplex_trimmed_windows": torch.tensor([3]),
+        },
+        mm_type=LATENT,
+    )
+
+    hidden = state.mm_accumulated.tensors["hidden_states.layer_0"]
+    assert isinstance(hidden, torch.Tensor)
+    assert hidden[:, 0].tolist() == [0, 1, 2, 9, 10, 11, 12, 13, 14]
+    assert state.mm_accumulated.get("duplex_trimmed_windows").tolist() == [3]
+
+
+def test_duplex_trim_keeps_other_request_history_unchanged() -> None:
+    trimmed = _make_state(RequestOutputKind.CUMULATIVE)
+    other = _make_state(RequestOutputKind.CUMULATIVE)
+    other.add_multimodal_tensor({"hidden_states.layer_0": torch.arange(10).reshape(10, 1)}, mm_type=LATENT)
+    trimmed.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(10).reshape(10, 1),
+            "duplex_trimmed_tokens": torch.tensor([4]),
+            "duplex_trim_prefix_rows": torch.tensor([3]),
+        },
+        mm_type=LATENT,
+    )
+    assert other.mm_accumulated.tensors["hidden_states.layer_0"][:, 0].tolist() == list(range(10))
+    assert other._duplex_trimmed_tokens == 0
+    assert trimmed.mm_accumulated.tensors["hidden_states.layer_0"][:, 0].tolist() == [0, 1, 2, 7, 8, 9]
+
+
+def test_duplex_trim_compacts_prompt_and_detokenizer_owners() -> None:
+    from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.prompt_token_ids = list(range(29))
+    state.detokenizer = IncrementalDetokenizer()
+    state.detokenizer.prompt_len = 0
+    first = [DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    second = [DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    state.detokenizer.token_ids = first + second
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(34).reshape(34, 1),
+            "duplex_trimmed_tokens": torch.tensor([13]),
+            "duplex_trimmed_windows": torch.tensor([1]),
+            "duplex_trim_prefix_rows": torch.tensor([9]),
+        },
+        mm_type=LATENT,
+    )
+    output = state.make_request_output([], None, None, None)
+    assert output is not None
+    assert state.prompt_token_ids == list(range(9)) + list(range(19, 29))
+    assert state.detokenizer.output_token_ids == second
+    assert state._duplex_compacted_windows == 1
+    assert output.outputs[0].cumulative_token_ids == second
+    assert output.outputs[0].multimodal_output.get("duplex_history_window_base").tolist() == [1]
+
+    third = [DUPLEX_TOKENS.speak, 102, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    state.prompt_token_ids.extend(range(29, 39))
+    state.detokenizer.token_ids.extend(third)
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(34, 49).reshape(15, 1),
+            "duplex_trimmed_tokens": torch.tensor([26]),
+            "duplex_trimmed_windows": torch.tensor([2]),
+            "duplex_trim_prefix_rows": torch.tensor([9]),
+        },
+        mm_type=LATENT,
+    )
+    next_output = state.make_request_output([], None, None, None)
+    assert next_output is not None
+    assert state.prompt_token_ids == list(range(9)) + list(range(29, 39))
+    assert state.detokenizer.output_token_ids == third
+    assert next_output.outputs[0].cumulative_token_ids == third
+    assert next_output.outputs[0].multimodal_output.get("duplex_history_window_base").tolist() == [2]
+
+
+def test_duplex_trim_compacts_fast_detokenizer_without_prompt_len() -> None:
+    from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.prompt_token_ids = list(range(29))
+    detokenizer = FastIncrementalDetokenizer.__new__(FastIncrementalDetokenizer)
+    IncrementalDetokenizer.__init__(detokenizer)
+    detokenizer.output_text = ""
+    detokenizer.stop = []
+    detokenizer.min_tokens = 0
+    detokenizer.stop_buffer_length = 0
+    state.detokenizer = detokenizer
+    first = [DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    second = [DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    detokenizer.token_ids = first + second
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(34).reshape(34, 1),
+            "duplex_trimmed_tokens": torch.tensor([13]),
+            "duplex_trimmed_windows": torch.tensor([1]),
+            "duplex_trim_prefix_rows": torch.tensor([9]),
+        },
+        mm_type=LATENT,
+    )
+    output = state.make_request_output([], None, None, None)
+    assert output is not None
+    assert detokenizer.output_token_ids == second
+    assert state.prompt_token_ids == list(range(9)) + list(range(19, 29))
+    assert output.outputs[0].cumulative_token_ids == second
+
+
+def test_duplex_trim_adjusts_delta_cursor_without_replaying_old_tokens() -> None:
+    from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
+
+    state = _make_state(RequestOutputKind.DELTA)
+    state.prompt_token_ids = list(range(29))
+    state.detokenizer = IncrementalDetokenizer()
+    state.detokenizer.prompt_len = 0
+    first = [DUPLEX_TOKENS.speak, 100, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    second = [DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    state.detokenizer.token_ids = first + second
+    state.sent_tokens_offset = len(first + second)
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(34).reshape(34, 1),
+            "duplex_trimmed_tokens": torch.tensor([13]),
+            "duplex_trimmed_windows": torch.tensor([1]),
+            "duplex_trim_prefix_rows": torch.tensor([9]),
+        },
+        mm_type=LATENT,
+    )
+    state.make_request_output([], None, None, None)
+    assert state.sent_tokens_offset == len(second)
+    state.detokenizer.update([102], False)
+    output = state.make_request_output([102], None, None, None)
+    assert output is not None
+    assert output.outputs[0].cumulative_token_ids == second + [102]
+
+
+def test_duplex_trim_rejects_inconsistent_layers_without_partial_compaction() -> None:
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    with pytest.raises(ValueError, match="exceeds accumulated Thinker rows"):
+        state.add_multimodal_tensor(
+            {
+                "hidden_states.layer_0": torch.arange(12).reshape(12, 1),
+                "hidden_states.layer_24": torch.arange(3).reshape(3, 1),
+                "duplex_trimmed_tokens": torch.tensor([4]),
+                "duplex_trim_prefix_rows": torch.tensor([3]),
+            },
+            mm_type=LATENT,
+        )
+    assert state.mm_accumulated.is_empty
+    assert state._duplex_trimmed_tokens == 0
+
+
+def test_duplex_trim_rejects_backwards_marker() -> None:
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    state.add_multimodal_tensor(
+        {
+            "hidden_states.layer_0": torch.arange(12).reshape(12, 1),
+            "duplex_trimmed_tokens": torch.tensor([4]),
+            "duplex_trim_prefix_rows": torch.tensor([3]),
+        },
+        mm_type=LATENT,
+    )
+    with pytest.raises(ValueError, match="moved backwards"):
+        state.add_multimodal_tensor(
+            {
+                "hidden_states.layer_0": torch.tensor([[12]]),
+                "duplex_trimmed_tokens": torch.tensor([3]),
+                "duplex_trim_prefix_rows": torch.tensor([3]),
+            },
+            mm_type=LATENT,
+        )
+    assert state.mm_accumulated.tensors["hidden_states.layer_0"][:, 0].tolist() == [0, 1, 2, 7, 8, 9, 10, 11]
+    assert state.mm_accumulated.get("duplex_trimmed_tokens").tolist() == [4]
+    assert state._duplex_trimmed_tokens == 4
 
 
 def test_finish_consolidates_hidden_states():
