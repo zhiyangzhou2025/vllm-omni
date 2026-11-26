@@ -14,6 +14,7 @@ forces, and no synthesised VAD.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -26,12 +27,14 @@ from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
     closed_window_count,
+    window_actions,
     window_decision,
     window_text_role,
     window_token_ids,
     window_user_activity,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import UNIT_DURATION_MS
+from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
 # Consecutive silent windows that end a user utterance. One silent window is
 # jitter, not a boundary: in the 54-window reference run the silent runs were
@@ -67,10 +70,41 @@ class _TurnAudio:
     windows: deque[tuple[int, bool]] = field(default_factory=deque)
 
 
+SYSTEM2_LAUNCH = "system2_launch"
+SYSTEM2_CANCEL = "system2_cancel"
+# The projected result that carries one System 2 call. It is its own result
+# with no text, because the session publishes a recognized call and drops the
+# rest of that result.
+FUNCTION_CALL_KEY = "qwen3_duplex_function_call"
+
+
+@dataclass
+class System2Generation:
+    """One request's System 2 generation, as the client sees it.
+
+    ``generation_id`` names the generation the model launched and has neither
+    cancelled nor received a final result for. ``awaiting`` is the one launch
+    call whose result is still owed. ``relaunch`` asks the next closed window
+    to publish the call for the generation's next result.
+    """
+
+    generation_id: str | None = None
+    awaiting: str | None = None
+    result_index: int = 0
+    relaunch: bool = False
+
+
+def _new_call_id() -> str:
+    return f"call_{uuid4().hex}"
+
+
 class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
     def __init__(self, encode_audio: Any = None) -> None:
         self.terminal: set[str] = set()
         self._user_speech: dict[str, _UserSpeech] = {}
+        self.system2: dict[str, System2Generation] = {}
+        # Every published call names the request it belongs to until it settles.
+        self.call_requests: dict[str, str] = {}
         self._encode_audio = encode_audio
         # Set by the plugin once the deployment's stages are known. None means
         # this deployment has no audio stage, so Stage 0 behaves as before.
@@ -114,6 +148,74 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
             for request_id, turns in self._turns.items()
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
+        self.system2 = {
+            request_id: generation
+            for request_id, generation in self.system2.items()
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
+        self.call_requests = {
+            call_id: request_id
+            for call_id, request_id in self.call_requests.items()
+            if not duplex_resource_request_belongs_to_session(request_id, session_id)
+        }
+
+    def _system2_calls(self, request_id: str, actions: Sequence[int]) -> list[dict[str, str]]:
+        """The calls one closed window publishes, in the order the model acted."""
+        generation = self.system2.setdefault(request_id, System2Generation())
+        calls: list[dict[str, str]] = []
+        for token_id in actions:
+            if token_id == DUPLEX_TOKENS.cancel and generation.generation_id is not None:
+                calls.append(self._publish(request_id, SYSTEM2_CANCEL, {"generation_id": generation.generation_id}))
+                generation.generation_id = generation.awaiting = None
+                generation.relaunch = False
+            elif token_id == DUPLEX_TOKENS.launch:
+                call_id = _new_call_id()
+                generation.generation_id = generation.awaiting = call_id
+                generation.result_index = 0
+                generation.relaunch = False
+                calls.append(
+                    self._publish(
+                        request_id, SYSTEM2_LAUNCH, {"generation_id": call_id, "result_index": 0}, call_id=call_id
+                    )
+                )
+        if generation.relaunch and generation.generation_id is not None:
+            generation.relaunch = False
+            generation.result_index += 1
+            generation.awaiting = _new_call_id()
+            calls.append(
+                self._publish(
+                    request_id,
+                    SYSTEM2_LAUNCH,
+                    {"generation_id": generation.generation_id, "result_index": generation.result_index},
+                    call_id=generation.awaiting,
+                )
+            )
+        return calls
+
+    def _publish(
+        self, request_id: str, name: str, arguments: dict[str, object], *, call_id: str | None = None
+    ) -> dict[str, str]:
+        call_id = call_id or _new_call_id()
+        self.call_requests[call_id] = request_id
+        return {"call_id": call_id, "name": name, "arguments": json.dumps(arguments)}
+
+    def settled_call(self, call_id: str) -> None:
+        """The client answered, or can no longer answer, this call."""
+        request_id = self.call_requests.pop(call_id, None)
+        generation = self.system2.get(request_id) if request_id is not None else None
+        if generation is not None and generation.awaiting == call_id:
+            generation.awaiting = None
+
+    def submitted_result(self, request_id: str, generation_id: str, *, final: bool) -> None:
+        """A result reached the Thinker: end its generation or ask for the next result."""
+        generation = self.system2.get(request_id)
+        if generation is None or generation.generation_id != generation_id:
+            return
+        if final:
+            generation.generation_id = generation.awaiting = None
+            generation.relaunch = False
+        elif generation.awaiting is None:
+            generation.relaunch = True
 
     def project(self, result: object, *, context: object | None = None) -> Iterable[dict[str, object]]:
         if not isinstance(result, dict):
@@ -175,27 +277,41 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         # stages below the final one, and Stage 0 is the only stage.
         decision = window_decision(token_ids)
         user_speech_events = () if decision is None else _close_user_window(speech, token_ids)
-        yield {
-                "supported": True,
-                "data_plane_request_id": request_id,
-                "text": text,
-                "audio_data": "",
-                "audio_format": response_format,
-                "audio_duration_ms": 0,
-                "audio_text_mark": False,
-                "text_requires_complete_audio": False,
-                "audio_complete": False,
-                "sample_rate_hz": 24000,
-                "history_audio_pcm": None,
-                "history_audio_supported": False,
-                "is_listen": decision == "listen",
-                "model_listen": decision == "listen",
-                "end_of_turn": decision == "turn_end",
-                "user_speech_events": list(user_speech_events),
-                "model_turn_id": model_turn_id,
-                "runtime_impl": "qwen3_omni_duplex_stage0",
-                "uses_model_runner_scheduler": True,
-                "runner_kv_backed": True,
+        projected: dict[str, object] = {
+            "supported": True,
+            "data_plane_request_id": request_id,
+            "text": text,
+            "audio_data": "",
+            "audio_format": response_format,
+            "audio_duration_ms": 0,
+            "audio_text_mark": False,
+            "text_requires_complete_audio": False,
+            "audio_complete": False,
+            "sample_rate_hz": 24000,
+            "history_audio_pcm": None,
+            "history_audio_supported": False,
+            "is_listen": decision == "listen",
+            "model_listen": decision == "listen",
+            "end_of_turn": decision == "turn_end",
+            "user_speech_events": list(user_speech_events),
+            "model_turn_id": model_turn_id,
+            "runtime_impl": "qwen3_omni_duplex_stage0",
+            "uses_model_runner_scheduler": True,
+            "runner_kv_backed": True,
+        }
+        yield projected
+        if decision is None:
+            return
+        # The window's text and audio go out first; each call follows on its own.
+        for call in self._system2_calls(request_id, window_actions(token_ids)):
+            yield {
+                **projected,
+                "text": "",
+                "is_listen": False,
+                "model_listen": False,
+                "end_of_turn": False,
+                "user_speech_events": [],
+                FUNCTION_CALL_KEY: call,
             }
 
     def _project_with_audio(
@@ -230,9 +346,10 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                     "user_speech_events": [],
                     "model_turn_id": model_turn_id,
                 }
-            for projected in self._project_stage0(
-                output, model_turn_id=model_turn_id, response_format=response_format
-            ):
+            for projected in self._project_stage0(output, model_turn_id=model_turn_id, response_format=response_format):
+                if FUNCTION_CALL_KEY in projected:
+                    yield projected
+                    continue
                 in_flight = turns.done_turn < turns.s_turn
                 turns.template = dict(projected)
                 if projected["text"] and in_flight:
@@ -244,7 +361,9 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
                     turns.windows.append((turns.s_turn, decision == "turn_end"))
                     if decision == "turn_end":
                         turns.s_turn += 1
-                elif decision == "listen" and in_flight and getattr(context, "active_response_turn_id", None) is not None:
+                elif (
+                    decision == "listen" and in_flight and getattr(context, "active_response_turn_id", None) is not None
+                ):
                     projected["is_listen"] = False
                     projected["model_listen"] = False
                 yield projected

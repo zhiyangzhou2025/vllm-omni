@@ -134,6 +134,7 @@ def build_audio_window_prompt(
     payload: object,
     final: bool,
     prefix_token_ids: tuple[int, ...] = (),
+    tool_token_ids: Sequence[int] = (),
 ) -> dict[str, object]:
     """Reserve one exact 0.48-second audio window in the Stage 0 scheduler.
 
@@ -151,7 +152,13 @@ def build_audio_window_prompt(
     # <|unit_end|>, and the scheduler drops that sampled token, so one slot
     # holding it is all the previous window leaves behind.
     closure = () if seq <= 1 else (DUPLEX_TOKENS.unit_end,)
-    prompt_token_ids = [*prefix_token_ids, *closure, *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS)]
+    # A System 2 result sits between the previous window and this one.
+    prompt_token_ids = [
+        *prefix_token_ids,
+        *closure,
+        *tool_token_ids,
+        *([token_id] * AUDIO_WINDOW_PROMPT_TOKENS),
+    ]
     return build_duplex_append_prompt(
         request_id=request_id,
         fence=fence,

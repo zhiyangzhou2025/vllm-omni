@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -19,6 +22,9 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.data_plane import (
+    FUNCTION_CALL_KEY,
+    SYSTEM2_CANCEL,
+    SYSTEM2_LAUNCH,
     Qwen3OmniDuplexDataPlane,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.sampling import (
@@ -32,12 +38,26 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.session import (
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
     INPUT_SAMPLE_RATE_HZ,
     INPUT_SAMPLES_PER_UNIT,
+    TOOL_BLOCK_END,
+    TOOL_BLOCK_NEWLINE,
+    TOOL_BLOCK_START,
     UNIT_DURATION_MS,
     build_audio_window_prompt,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+
+logger = init_logger(__name__)
+
 PLUGIN_ID = "qwen3_omni_duplex"
+# A System 2 result enters the Thinker's context in the reference runtime's form.
+TOOL_BLOCK_TEMPLATE = "<|im_start|>tool\n{content}<|im_end|>\n"
+# The accepted result the next append carries, and the private prompt key that
+# names it once that append is planned.
+SYSTEM2_PENDING_KEY = "system2_pending_result"
+_SYSTEM2_SUBMITTED_KEY = "_qwen3_duplex_system2_submitted"
 # The session's system prompt, wrapped in the chat template. A client that sets
 # no instructions gets the reference runtime's prompt.
 DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
@@ -92,6 +112,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self._speak_turn_modalities: dict[str, tuple[str, ...]] = {}
         # Kept so a session update before the first window can re-encode the prefix.
         self._instructions_model_config: object | None = None
+        # The System 2 result each planned append carries, until the stage accepts it.
+        self._pending_system2: dict[str, Mapping[str, object]] = {}
+        self._tokenizers: dict[str, object] = {}
 
     def configure_pipeline(self, pipeline_config: object) -> None:
         stages = getattr(pipeline_config, "stages", ()) or ()
@@ -148,19 +171,142 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # ``build_audio_window_prompt`` reserves from the sequence number.
         self._request_session_keys[request_id] = str(runtime_config.get("duplex_session_key", request_id))
         prefix = () if request_id in self._submitted_prefix else self._system_prefix_token_ids(runtime_config)
+        # An accepted System 2 result enters ahead of this window. It stays in
+        # the runtime until the stage accepts this append.
+        result = runtime_config.get(SYSTEM2_PENDING_KEY)
+        tool_token_ids: list[int] = []
+        if isinstance(result, Mapping):
+            tool_token_ids = [int(token_id) for token_id in result["token_ids"]]
+            payload = {**dict(payload), "system2_result": "final" if result["final"] else "partial"}  # type: ignore[call-overload]
+            self._pending_system2[request_id] = result
+        else:
+            self._pending_system2.pop(request_id, None)
         prompt = build_audio_window_prompt(
             request_id=request_id,
             fence=fence,
             session_config=session_config,
-            runtime_config=runtime_config,
+            runtime_config={key: value for key, value in runtime_config.items() if key != SYSTEM2_PENDING_KEY},
             seq=seq,
             turn_seq=turn_seq,
             payload=payload,
             final=final,
             prefix_token_ids=prefix,
+            tool_token_ids=tool_token_ids,
         )
+        if isinstance(result, Mapping):
+            prompt[_SYSTEM2_SUBMITTED_KEY] = result["call_id"]
         self._pending_prefix[request_id] = prefix
         return DuplexAppendPlan(prompt=prompt)
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        call_id = prompt.pop(_SYSTEM2_SUBMITTED_KEY, None)
+        return None if call_id is None else {_SYSTEM2_SUBMITTED_KEY: call_id}
+
+    def reconcile_submitted_runtime(
+        self, current: Mapping[str, object], updated: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        """Drop the submitted result only; one accepted while the append was planned stays."""
+        reconciled = dict(updated)
+        call_id = reconciled.pop(_SYSTEM2_SUBMITTED_KEY, None)
+        if call_id is None:
+            return None
+        pending = current.get(SYSTEM2_PENDING_KEY)
+        if isinstance(pending, Mapping) and pending.get("call_id") == call_id:
+            reconciled.pop(SYSTEM2_PENDING_KEY, None)
+        return reconciled
+
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        call = model_result.get(FUNCTION_CALL_KEY)
+        return dict(call) if isinstance(call, Mapping) else None
+
+    def runtime_config_for_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
+    ) -> dict[str, object] | None:
+        """Render a launch result as the ToolBlock the next window carries.
+
+        A cancel acknowledgement only settles its call. A launch result must
+        answer the call its generation still awaits, and its ``output`` is
+        ``{"content": str, "final": bool}``; ``content`` enters verbatim.
+        """
+        del config, history_len
+        call_id, name = item.get("call_id"), item.get("name")
+        if name == SYSTEM2_CANCEL:
+            return None
+        if name != SYSTEM2_LAUNCH or not isinstance(call_id, str):
+            raise DuplexRuntimeConfigError(
+                f"Qwen3-Omni-Duplex has no System 2 call {call_id!r}", code="invalid_function_call_output"
+            )
+        request_id = self.data_plane.call_requests.get(call_id)
+        generation = self.data_plane.system2.get(request_id) if request_id is not None else None
+        if generation is None or generation.awaiting != call_id:
+            raise DuplexRuntimeConfigError(
+                f"System 2 call {call_id} is not the one its generation awaits", code="invalid_function_call_output"
+            )
+        try:
+            output = json.loads(item.get("output"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            output = None
+        if (
+            not isinstance(output, dict)
+            or not isinstance(output.get("content"), str)
+            or not isinstance(output.get("final"), bool)
+        ):
+            raise DuplexRuntimeConfigError(
+                'a System 2 result is the JSON object {"content": str, "final": bool}',
+                code="invalid_function_call_output",
+            )
+        token_ids = self._encode_tool_block(output["content"])
+        if current.get(SYSTEM2_PENDING_KEY) is not None:
+            logger.warning("System 2 result %s replaces one the Thinker has not read", call_id)
+        return {
+            **current,
+            SYSTEM2_PENDING_KEY: {
+                "call_id": call_id,
+                "generation_id": generation.generation_id,
+                "token_ids": token_ids,
+                "final": output["final"],
+            },
+        }
+
+    def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
+        self.data_plane.settled_call(settlement.origin.call_id)
+
+    def on_tool_calls_closed(self, origins: tuple[ToolCallOrigin, ...]) -> None:
+        for origin in origins:
+            self.data_plane.settled_call(origin.call_id)
+
+    def retire_pending_function_output(
+        self, config: DuplexSessionConfig, current: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        del config
+        if current.get(SYSTEM2_PENDING_KEY) is None:
+            return None
+        return {key: value for key, value in current.items() if key != SYSTEM2_PENDING_KEY}
+
+    def _encode_tool_block(self, content: str) -> list[int]:
+        tokenizer = self._tokenizer(self._instructions_model_config)
+        if tokenizer is None:
+            raise DuplexRuntimeConfigError("Qwen3-Omni-Duplex Stage 0 cannot encode a System 2 result")
+        text = TOOL_BLOCK_TEMPLATE.format(content=content)
+        token_ids = [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]  # type: ignore[attr-defined]
+        special = {int(token_id) for token_id in tokenizer.added_tokens_decoder}  # type: ignore[attr-defined]
+        special.update(int(token_id) for token_id in tokenizer.all_special_ids)  # type: ignore[attr-defined]
+        # Only the wrapper may be special: a special token in the content would
+        # read as protocol, and a stray <|im_end|> would end the block early.
+        if (
+            token_ids[:1] != [TOOL_BLOCK_START]
+            or token_ids[-2:] != [TOOL_BLOCK_END, TOOL_BLOCK_NEWLINE]
+            or any(token_id in special for token_id in token_ids[1:-2])
+        ):
+            raise DuplexRuntimeConfigError(
+                "a System 2 result's content must not contain special tokens", code="invalid_function_call_output"
+            )
+        return token_ids
 
     def decide_output(
         self,
@@ -216,6 +362,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         prefix = self._pending_prefix.pop(request_id, None)
         if prefix is not None:
             self._submitted_prefix[request_id] = prefix
+        result = self._pending_system2.pop(request_id, None)
+        if result is not None:
+            self.data_plane.submitted_result(request_id, str(result["generation_id"]), final=bool(result["final"]))
 
     def _close_session(self, session_id: str) -> None:
         from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
@@ -226,6 +375,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 self._speak_turn_modalities.pop(key, None)
                 self._pending_prefix.pop(request_id, None)
                 self._submitted_prefix.pop(request_id, None)
+                self._pending_system2.pop(request_id, None)
 
     def create_session_state(self) -> Qwen3OmniDuplexSessionState:
         return Qwen3OmniDuplexSessionState()
@@ -320,18 +470,30 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             config.modalities = list(locked)
         return updated
 
-    def _encode_system_prefix(self, model_config: object | None, instructions: str) -> tuple[int, ...] | None:
+    def _tokenizer(self, model_config: object | None) -> object | None:
         model_path = getattr(model_config, "model", None)
         if not isinstance(model_path, str) or not model_path:
             return None
-        try:
+        if model_path not in self._tokenizers:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
-            token_ids = tokenizer.encode(
+            try:
+                self._tokenizers[model_path] = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=True, local_files_only=True
+                )
+            except (OSError, ValueError):
+                return None
+        return self._tokenizers[model_path]
+
+    def _encode_system_prefix(self, model_config: object | None, instructions: str) -> tuple[int, ...] | None:
+        tokenizer = self._tokenizer(model_config)
+        if tokenizer is None:
+            return None
+        try:
+            token_ids = tokenizer.encode(  # type: ignore[attr-defined]
                 SYSTEM_PREFIX_TEMPLATE.format(instructions=instructions), add_special_tokens=False
             )
-        except (OSError, ValueError):
+        except ValueError:
             return None
         if not token_ids:
             return None

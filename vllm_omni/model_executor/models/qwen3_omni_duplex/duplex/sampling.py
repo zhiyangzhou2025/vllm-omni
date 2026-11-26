@@ -148,6 +148,13 @@ def window_user_activity(token_ids: Sequence[int]) -> str | None:
     return None
 
 
+def window_actions(token_ids: Sequence[int]) -> list[int]:
+    """The newest window's System 2 actions, ``<|launch|>`` / ``<|cancel|>``, in order."""
+
+    actions = (DUPLEX_TOKENS.launch, DUPLEX_TOKENS.cancel)
+    return [token_id for token_id in _newest_window(token_ids) if token_id in actions]
+
+
 def _newest_window(token_ids: Sequence[int]) -> Sequence[int]:
     """Slice off the newest window, whether it just closed or is still open.
 
@@ -193,6 +200,7 @@ __all__ = [
     "Stage0Windows",
     "ThinkerProtocolError",
     "closed_window_count",
+    "window_actions",
     "window_decision",
     "window_text_role",
     "window_token_ids",
