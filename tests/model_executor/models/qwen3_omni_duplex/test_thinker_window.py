@@ -107,6 +107,17 @@ def test_system2_action_order_and_reserved_text_rejection() -> None:
         state.observe(DUPLEX_TOKENS.listen)
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_speak_exposes_launch_only_when_idle_and_cancel_only_when_active(active: bool) -> None:
+    state = _state(active_generation=active)
+    state.observe(DUPLEX_TOKENS.speak)
+    logits = state.control_logits({DUPLEX_TOKENS.launch: 1.0, DUPLEX_TOKENS.cancel: 1.0, 100: 1.0})
+
+    assert (DUPLEX_TOKENS.launch in logits, DUPLEX_TOKENS.cancel in logits) == (not active, active)
+    with pytest.raises(ThinkerProtocolError):
+        state.observe(DUPLEX_TOKENS.launch if active else DUPLEX_TOKENS.cancel)
+
+
 def test_asr_budget_exposes_only_asr_eos() -> None:
     state = _state(user_signal="transcript", max_text_tokens=1)
     state.observe(DUPLEX_TOKENS.asr)

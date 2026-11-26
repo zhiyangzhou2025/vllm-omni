@@ -33,12 +33,13 @@ MAX_TEXT_TOKENS_PER_WINDOW = 8
 class Stage0Window:
     """One request's window, from its first sampled token to ``<|unit_end|>``."""
 
-    def __init__(self, user_signal: UserSignalMode) -> None:
+    def __init__(self, user_signal: UserSignalMode, *, active_generation: bool = False) -> None:
         self.state = ThinkerWindowState(
             tokens=DUPLEX_TOKENS,
             user_signal=user_signal,
             max_generated_tokens=MAX_GENERATED_TOKENS_PER_WINDOW,
             max_text_tokens=MAX_TEXT_TOKENS_PER_WINDOW,
+            active_generation=active_generation,
         )
         self.closed = False
 
@@ -52,16 +53,32 @@ class Stage0Window:
 
 
 class Stage0Windows:
-    """Window states keyed by request, reset whenever a window closes."""
+    """Window states keyed by request, reset whenever a window closes.
+
+    Whether a System 2 generation is running outlives the window: a closed
+    window's ``<|launch|>`` / ``<|cancel|>`` carry it into the next one, and a
+    final tool result injected ahead of a window ends it.
+    """
 
     def __init__(self, user_signal: UserSignalMode) -> None:
         self._user_signal = user_signal
         self._windows: dict[str, Stage0Window] = {}
+        self._active: dict[str, bool] = {}
 
-    def window_for(self, request_id: str) -> Stage0Window:
+    def window_for(self, request_id: str, *, system2_result: str | None = None) -> Stage0Window:
         window = self._windows.get(request_id)
         if window is None or window.closed:
-            window = Stage0Window(self._user_signal)
+            active = self._active.get(request_id, False)
+            if window is not None:
+                actions = window.state.actions
+                if "launch" in actions:
+                    active = True
+                elif "cancel" in actions:
+                    active = False
+            if system2_result == "final":
+                active = False
+            self._active[request_id] = active
+            window = Stage0Window(self._user_signal, active_generation=active)
             self._windows[request_id] = window
         return window
 

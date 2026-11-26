@@ -123,11 +123,13 @@ class ThinkerWindowState:
         allowed = {self.tokens.unit_end, self.tokens.turn_eos}
         bias: tuple[int, float] | None = None
         if self.phase == "action_or_text":
-            allowed.add(self.tokens.launch)
+            # A running System 2 generation may only be cancelled; launching a
+            # second one first takes the cancel and then ``launch_or_text``.
             if self.active_generation:
                 allowed.add(self.tokens.cancel)
                 bias = (self.tokens.cancel, cancel_bias)
             else:
+                allowed.add(self.tokens.launch)
                 bias = (self.tokens.launch, launch_bias)
         elif self.phase == "launch_or_text":
             allowed.add(self.tokens.launch)
@@ -208,6 +210,8 @@ class ThinkerWindowState:
         else:
             if self.tokens.launch in self._action_ids():
                 raise ThinkerProtocolError("duplicate <|launch|>")
+            if self.active_generation and self.tokens.cancel not in self._action_ids():
+                raise ThinkerProtocolError("<|launch|> while a generation is active")
             self.actions += ("launch",)
             self.phase = "text"
         return self._step(token_id)

@@ -557,7 +557,9 @@ class Qwen3OmniDuplexForConditionalGeneration(Qwen3OmniMoeForConditionalGenerati
             row_idx = getattr(row, "row_idx", -1)
             if row_idx < 0 or row_idx >= logits.shape[0]:
                 continue
-            window = self._stage0_windows.window_for(row.request_id)
+            payload = getattr(row, "payload", None)
+            system2_result = payload.get("system2_result") if isinstance(payload, dict) else None
+            window = self._stage0_windows.window_for(row.request_id, system2_result=system2_result)
             if window.closed:
                 continue
             _mask_illegal_logits(logits[row_idx], window)

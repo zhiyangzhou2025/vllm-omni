@@ -102,6 +102,60 @@ def test_text_phases_keep_text_and_drop_only_the_illegal_protocol_tokens() -> No
     assert torch.isneginf(logits[0, DUPLEX_TOKENS.cancel])
 
 
+def _close_speak_window(stage: _Stage, *actions: int) -> None:
+    window = stage._stage0_windows.window_for("req")
+    for token_id in (DUPLEX_TOKENS.speak, *actions, DUPLEX_TOKENS.unit_end):
+        window.observe(token_id)
+    assert window.closed
+
+
+def _speak_logits(stage: _Stage) -> torch.Tensor:
+    stage._stage0_windows.window_for("req").observe(DUPLEX_TOKENS.speak)
+    logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
+    stage.prepare_duplex_sampling(logits, None, (_row("req"),))
+    return logits
+
+
+def test_system2_generation_outlives_its_window_until_cancel() -> None:
+    stage = _Stage()
+    _close_speak_window(stage, DUPLEX_TOKENS.launch)
+    # Two windows later the launched generation still runs: only cancel is legal.
+    _close_speak_window(stage)
+    logits = _speak_logits(stage)
+    assert torch.isfinite(logits[0, DUPLEX_TOKENS.cancel])
+    assert torch.isneginf(logits[0, DUPLEX_TOKENS.launch])
+    stage._stage0_windows.window_for("req").observe(DUPLEX_TOKENS.cancel)
+    stage._stage0_windows.window_for("req").observe(DUPLEX_TOKENS.unit_end)
+
+    logits = _speak_logits(stage)
+    assert torch.isfinite(logits[0, DUPLEX_TOKENS.launch])
+    assert torch.isneginf(logits[0, DUPLEX_TOKENS.cancel])
+    # Another request never sees this request's generation.
+    assert not stage._stage0_windows.window_for("other").state.active_generation
+
+
+def test_cancel_then_launch_keeps_a_generation_running() -> None:
+    stage = _Stage()
+    _close_speak_window(stage, DUPLEX_TOKENS.launch)
+    _close_speak_window(stage, DUPLEX_TOKENS.cancel, DUPLEX_TOKENS.launch)
+
+    assert stage._stage0_windows.window_for("req").state.active_generation
+
+
+@pytest.mark.parametrize(("result", "active"), [("partial", True), ("final", False)])
+def test_only_a_final_tool_result_ends_the_generation(result: str, active: bool) -> None:
+    stage = _Stage()
+    _close_speak_window(stage, DUPLEX_TOKENS.launch)
+    logits = torch.full((1, DUPLEX_TOKENS.non_idle + 1), 5.0)
+    row = SimpleNamespace(row_idx=0, request_id="req", payload={"system2_result": result})
+    stage.prepare_duplex_sampling(logits, None, (row,))
+    # The result applies when a window opens; later steps of it do not reset it.
+    assert stage._stage0_windows.window_for("req").state.active_generation is active
+    stage._stage0_windows.window_for("req").observe(DUPLEX_TOKENS.listen)
+    stage.prepare_duplex_sampling(torch.full_like(logits, 5.0), None, (_row("req"),))
+    assert stage._stage0_windows.window_for("req").state.active_generation is active
+
+
 def test_turn_eos_forces_unit_end_before_the_window_closes() -> None:
     stage = _Stage()
     window = stage._stage0_windows.window_for("req")
