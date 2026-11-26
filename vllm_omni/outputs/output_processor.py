@@ -376,9 +376,14 @@ class OmniRequestState(RequestState):
                     break
         prefix_rows = self._duplex_trim_prefix_rows
         prompt_ids = self.prompt_token_ids
-        if closed < pending or prompt_ids is None or len(prompt_ids) < prefix_rows + pending * 10:
+        if closed < pending or prompt_ids is None:
             raise ValueError("Qwen3-Omni-Duplex trim exceeds output token or prompt history")
-        self.prompt_token_ids = prompt_ids[:prefix_rows] + prompt_ids[prefix_rows + pending * 10 :]
+        from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import trimmed_prompt_tokens
+
+        removed_prompt = trimmed_prompt_tokens(prompt_ids, prefix_tokens=prefix_rows, windows=pending)
+        if len(prompt_ids) < prefix_rows + removed_prompt:
+            raise ValueError("Qwen3-Omni-Duplex trim exceeds output token or prompt history")
+        self.prompt_token_ids = prompt_ids[:prefix_rows] + prompt_ids[prefix_rows + removed_prompt :]
         self.prompt_len = len(self.prompt_token_ids)
         prompt_len = getattr(detokenizer, "prompt_len", 0)
         del detokenizer.token_ids[prompt_len : prompt_len + remove_ids]

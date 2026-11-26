@@ -34,7 +34,11 @@ from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import BOOTSTRAP_ROWS
-from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import AUDIO_WINDOW_PROMPT_TOKENS
+from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
+    AUDIO_WINDOW_PROMPT_TOKENS,
+    trimmed_prompt_tokens,
+    window_prompt_layout,
+)
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 from vllm_omni.model_executor.stage_input_processors import qwen3_omni as _qwen3_omni
 
@@ -72,21 +76,34 @@ def _windows(token_ids: list[int]) -> list[list[int]]:
     return windows
 
 
-def _row_index(prefix_len: int, windows: list[list[int]]) -> tuple[list[int], list[int], int]:
-    """Indices of the context rows, of the last window's generated rows, and the row count."""
+def _row_index(
+    prefix_len: int, windows: list[list[int]], layout: list[tuple[int, int]]
+) -> tuple[list[int], list[int], list[int], int]:
+    """Context rows, their prompt positions, the last window's generated rows, and the row count.
+
+    ``layout`` holds each window prompt's ``(closure, tool)`` lengths. A
+    ToolBlock is Thinker context but not Talker context: ``audio_row_mask``
+    reads every window as the nine rows ahead of its ``<|unit_end|>``.
+    """
     context: list[int] = list(range(prefix_len))
+    positions: list[int] = list(range(prefix_len))
     generated_last: list[int] = []
-    row = prefix_len
-    for index, window in enumerate(windows):
+    row = position = prefix_len
+    for index, (window, (closure, tool)) in enumerate(zip(windows, layout, strict=True)):
         # Every append after the first reserves the previous window's <|unit_end|>.
-        n_context = (1 if index else 0) + AUDIO_WINDOW_PROMPT_TOKENS
-        context.extend(range(row, row + n_context))
-        row += n_context
+        context.extend(range(row, row + closure))
+        positions.extend(range(position, position + closure))
+        row += closure + tool
+        position += closure + tool
+        context.extend(range(row, row + AUDIO_WINDOW_PROMPT_TOKENS))
+        positions.extend(range(position, position + AUDIO_WINDOW_PROMPT_TOKENS))
+        row += AUDIO_WINDOW_PROMPT_TOKENS
+        position += AUDIO_WINDOW_PROMPT_TOKENS
         n_generated = len(window) - 1
         if index == len(windows) - 1:
             generated_last = list(range(row, row + n_generated))
         row += n_generated
-    return context, generated_last, row
+    return context, positions, generated_last, row
 
 
 def _duplex_payload(streaming_context: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -162,25 +179,27 @@ def thinker2talker(
         layers = multimodal["hidden_states"]["layers"]
         embed_rows, hidden_rows = layers[_EMBED_LAYER], layers[_HIDDEN_LAYER]
         prefix_len = len(duplex["runtime_config"]["system_prefix_token_ids"])
-        context_idx, generated_idx, total = _row_index(prefix_len, windows)
-        if not total == int(embed_rows.shape[0]) == int(hidden_rows.shape[0]):
-            raise ValueError(
-                f"Qwen3-Omni-Duplex Thinker forwarded {int(embed_rows.shape[0])} hidden rows, "
-                f"the window layout accounts for {total}"
-            )
         # The session's next append can reach the Thinker before this window is
         # forwarded, so the prompt may already hold rows the hidden states do not
         # cover. Those belong to the next window.
         prompt_source = list(getattr(output, "prompt_token_ids", None) or ())
         if trimmed_windows:
-            prompt_source = prompt_source[:prefix_len] + prompt_source[prefix_len + trimmed_windows * 10 :]
+            cut = trimmed_prompt_tokens(prompt_source, prefix_tokens=prefix_len, windows=trimmed_windows)
+            prompt_source = prompt_source[:prefix_len] + prompt_source[prefix_len + cut :]
             output.prompt_token_ids = prompt_source
-        prompt_ids = prompt_source[: len(context_idx)]
-        if len(prompt_ids) != len(context_idx):
+        layout = window_prompt_layout(prompt_source, prefix_tokens=prefix_len, windows=len(windows))
+        context_idx, prompt_positions, generated_idx, total = _row_index(prefix_len, windows, layout)
+        if not total == int(embed_rows.shape[0]) == int(hidden_rows.shape[0]):
             raise ValueError(
-                f"Qwen3-Omni-Duplex Thinker prompt has {len(prompt_ids)} rows, "
-                f"the window layout needs {len(context_idx)}"
+                f"Qwen3-Omni-Duplex Thinker forwarded {int(embed_rows.shape[0])} hidden rows, "
+                f"the window layout accounts for {total}"
             )
+        if prompt_positions and prompt_positions[-1] >= len(prompt_source):
+            raise ValueError(
+                f"Qwen3-Omni-Duplex Thinker prompt has {len(prompt_source)} rows, "
+                f"the window layout needs {prompt_positions[-1] + 1}"
+            )
+        prompt_ids = [prompt_source[position] for position in prompt_positions]
         generated_ids = window[speak_at:-1]
         generated_t = torch.tensor(generated_idx[speak_at:], dtype=torch.long)
         window_seq = int(state["window"]) + 1

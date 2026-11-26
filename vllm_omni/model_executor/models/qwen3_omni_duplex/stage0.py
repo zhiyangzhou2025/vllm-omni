@@ -20,6 +20,51 @@ AUDIO_TOKENS_PER_UNIT = 6
 AUDIO_BOUNDARY_TOKENS = 2
 UNIT_START_TOKENS = 1
 AUDIO_WINDOW_PROMPT_TOKENS = UNIT_START_TOKENS + AUDIO_BOUNDARY_TOKENS + AUDIO_TOKENS_PER_UNIT
+# A System 2 result enters the context as ``<|im_start|>tool\n{payload}<|im_end|>\n``
+# between the previous window's ``<|unit_end|>`` and the next window, as in the
+# reference runtime. IDs verified in the user_signal checkpoints' tokenizer.json.
+TOOL_BLOCK_START = 151644  # <|im_start|>
+TOOL_BLOCK_END = 151645  # <|im_end|>
+TOOL_BLOCK_NEWLINE = 198  # "\n"
+
+
+def tool_block_length(token_ids: Sequence[int], start: int) -> int:
+    """Length of the ToolBlock opening at ``start``, or 0 when none opens there."""
+    if start >= len(token_ids) or token_ids[start] != TOOL_BLOCK_START:
+        return 0
+    for index in range(start + 1, len(token_ids)):
+        if token_ids[index] == TOOL_BLOCK_END:
+            if index + 1 >= len(token_ids) or token_ids[index + 1] != TOOL_BLOCK_NEWLINE:
+                raise ValueError("Malformed Qwen3-Omni-Duplex tool block")
+            return index + 2 - start
+    raise ValueError("Unterminated Qwen3-Omni-Duplex tool block")
+
+
+def window_prompt_layout(prompt_ids: Sequence[int], *, prefix_tokens: int, windows: int) -> list[tuple[int, int]]:
+    """``(closure, tool)`` lengths of the first ``windows`` window prompts after the prefix.
+
+    A window's prompt is ``[<|unit_end|>] [ToolBlock] <|unit_start|> x 9``. The
+    first window after the prefix has no ``<|unit_end|>``: either it is the
+    session's first window or a trim removed that token with the window before.
+    """
+    layout: list[tuple[int, int]] = []
+    cursor = prefix_tokens
+    for index in range(windows):
+        closure = 1 if index else 0
+        tool = tool_block_length(prompt_ids, cursor + closure)
+        layout.append((closure, tool))
+        cursor += closure + tool + AUDIO_WINDOW_PROMPT_TOKENS
+    return layout
+
+
+def trimmed_prompt_tokens(prompt_ids: Sequence[int], *, prefix_tokens: int, windows: int) -> int:
+    """Prompt tokens a trim of ``windows`` windows removes after the prefix.
+
+    That is every trimmed window's prompt plus the ``<|unit_end|>`` that opens
+    the next window's prompt, since it closed the last trimmed window.
+    """
+    layout = window_prompt_layout(prompt_ids, prefix_tokens=prefix_tokens, windows=windows)
+    return sum(closure + tool + AUDIO_WINDOW_PROMPT_TOKENS for closure, tool in layout) + 1
 
 
 @dataclass(frozen=True)
@@ -48,6 +93,8 @@ def plan_history_trim(
     speaking = False
     candidates: list[HistoryTrimPlan] = []
     while cursor < len(token_ids):
+        # A tool result injected ahead of the window belongs to it.
+        cursor += tool_block_length(token_ids, cursor)
         end_prompt = cursor + AUDIO_WINDOW_PROMPT_TOKENS
         if list(token_ids[cursor:end_prompt]) != [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS:
             raise ValueError("Malformed Qwen3-Omni-Duplex history window prompt")

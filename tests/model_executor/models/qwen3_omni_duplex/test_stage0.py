@@ -15,10 +15,16 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.model_executor.models.qwen3_omni_duplex.qwen3_omni_duplex import (
     Qwen3OmniDuplexForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.qwen3_omni_duplex.duplex.talker_row import audio_row_mask
 from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (
     AUDIO_WINDOW_PROMPT_TOKENS,
+    TOOL_BLOCK_END,
+    TOOL_BLOCK_NEWLINE,
+    TOOL_BLOCK_START,
     build_audio_window_prompt,
     plan_history_trim,
+    trimmed_prompt_tokens,
+    window_prompt_layout,
 )
 from vllm_omni.model_executor.models.qwen3_omni_duplex.tokens import DUPLEX_TOKENS
 from vllm_omni.model_executor.stage_input_processors.qwen3_omni_duplex import thinker2talker
@@ -66,6 +72,85 @@ def test_history_trim_selects_closed_turn_and_aligned_prefix() -> None:
 
     assert plan is not None
     assert (plan.removed_tokens, plan.removed_windows) == (70, 6)
+
+
+_TOOL_BLOCK = [TOOL_BLOCK_START, 14172, TOOL_BLOCK_NEWLINE, 500, 501, TOOL_BLOCK_END, TOOL_BLOCK_NEWLINE]
+_US = [DUPLEX_TOKENS.unit_start] * AUDIO_WINDOW_PROMPT_TOKENS
+
+
+def test_history_trim_counts_a_tool_block_with_the_window_it_precedes() -> None:
+    tokens = [*_window(), *_TOOL_BLOCK, *_window(), *_window()]
+
+    plan = plan_history_trim(tokens, prefix_tokens=0, block_size=1, required_tokens=1, target_tokens=27)
+
+    assert plan is not None
+    assert (plan.removed_tokens, plan.removed_windows) == (27, 2)
+
+
+def test_trimmed_prompt_tokens_matches_fixed_windows_and_adds_tool_blocks() -> None:
+    plain = list(range(9)) + _US + [DUPLEX_TOKENS.unit_end] + _US + [DUPLEX_TOKENS.unit_end] + _US
+    assert trimmed_prompt_tokens(plain, prefix_tokens=9, windows=1) == 10
+    assert trimmed_prompt_tokens(plain, prefix_tokens=9, windows=2) == 20
+    with_tool = list(range(9)) + _US + [DUPLEX_TOKENS.unit_end, *_TOOL_BLOCK] + _US + [DUPLEX_TOKENS.unit_end] + _US
+    assert window_prompt_layout(with_tool, prefix_tokens=9, windows=3) == [(0, 0), (1, 7), (1, 0)]
+    assert trimmed_prompt_tokens(with_tool, prefix_tokens=9, windows=2) == 27
+    with pytest.raises(ValueError, match="tool block"):
+        window_prompt_layout(with_tool[:24], prefix_tokens=9, windows=2)
+
+
+def _talker_buffer(output: SimpleNamespace) -> dict:
+    context = SimpleNamespace(
+        bridge_states={"duplex": {"runtime_config": {"system_prefix_token_ids": list(range(9))}}}
+    )
+    return thinker2talker([output], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+
+def _thinker_output(token_ids: list[int], prompt: list[int], n_rows: int, **markers: int) -> SimpleNamespace:
+    rows = torch.arange(n_rows * 2, dtype=torch.float32).reshape(n_rows, 2)
+    multimodal = {
+        **{key: torch.tensor([value]) for key, value in markers.items()},
+        "hidden_states": {"layers": {0: rows.clone(), 24: rows.clone()}},
+        "embed": {"tts_bos": rows[:1], "tts_eos": rows[:1], "tts_pad": rows[:1]},
+    }
+    return SimpleNamespace(
+        outputs=[SimpleNamespace(cumulative_token_ids=token_ids, multimodal_output=multimodal)],
+        multimodal_output=multimodal,
+        prompt_token_ids=prompt,
+    )
+
+
+def test_thinker2talker_keeps_tool_block_rows_out_of_the_talker_context() -> None:
+    prefix = list(range(9))
+    first = [DUPLEX_TOKENS.speak, DUPLEX_TOKENS.launch, 100, DUPLEX_TOKENS.unit_end]
+    second = [DUPLEX_TOKENS.speak, 101, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    prompt = prefix + _US + [DUPLEX_TOKENS.unit_end, *_TOOL_BLOCK] + _US
+    output = _thinker_output(first + second, prompt, 41)
+
+    buffer = _talker_buffer(output)
+
+    talker_prompt = prefix + _US + [DUPLEX_TOKENS.unit_end] + _US
+    assert buffer["ids"]["prompt"] == talker_prompt
+    context_rows = [*range(18), 21, *range(29, 38)]
+    rows = torch.arange(41 * 2, dtype=torch.float32).reshape(41, 2)
+    assert buffer["hidden_states"]["output"] == rows[context_rows].tolist()
+    assert buffer["embed"]["prefill"] == rows[[*context_rows, 38, 39, 40]].tolist()
+    assert int(audio_row_mask(torch.tensor(talker_prompt)).sum()) == 12
+
+
+def test_thinker2talker_trims_a_window_whose_successor_carries_a_tool_block() -> None:
+    prefix = list(range(9))
+    windows = [
+        [DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end],
+        [DUPLEX_TOKENS.listen, DUPLEX_TOKENS.unit_end],
+        [DUPLEX_TOKENS.speak, 102, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end],
+    ]
+    prompt = prefix + _US + [DUPLEX_TOKENS.unit_end, *_TOOL_BLOCK] + _US + [DUPLEX_TOKENS.unit_end] + _US
+    output = _thinker_output(sum(windows, []), prompt, 9 + 16 + 1 + 10 + 3, duplex_trimmed_windows=1)
+
+    buffer = _talker_buffer(output)
+
+    assert output.prompt_token_ids == prefix + _TOOL_BLOCK + _US + [DUPLEX_TOKENS.unit_end] + _US
+    assert buffer["ids"]["prompt"] == prefix + _US + [DUPLEX_TOKENS.unit_end] + _US
 
 
 def test_history_trim_does_not_cut_open_turn() -> None:
