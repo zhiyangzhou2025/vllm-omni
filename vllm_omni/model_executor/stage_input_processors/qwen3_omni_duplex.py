@@ -151,8 +151,9 @@ def thinker2talker(
             raise ValueError("Qwen3-Omni-Duplex trim must retain the current window")
         windows = all_windows[trimmed_windows:]
         window = windows[-1]
-        if window[0] != DUPLEX_TOKENS.speak:
-            raise ValueError(f"Qwen3-Omni-Duplex forwarded a window that does not open with <|speak|>: {window}")
+        # Only speak windows are forwarded; the first <|speak|> is the control
+        # token, and the user_signal prefix ahead of it is not for the Talker.
+        speak_at = window.index(DUPLEX_TOKENS.speak)
         duplex, bridge = _duplex_payload(_streaming_context)
         state = bridge.setdefault(_BRIDGE_KEY, {"window": -1, "turn_open": False})
         turn_start = not state["turn_open"]
@@ -180,8 +181,8 @@ def thinker2talker(
                 f"Qwen3-Omni-Duplex Thinker prompt has {len(prompt_ids)} rows, "
                 f"the window layout needs {len(context_idx)}"
             )
-        generated_ids = window[:-1]
-        generated_t = torch.tensor(generated_idx, dtype=torch.long)
+        generated_ids = window[speak_at:-1]
+        generated_t = torch.tensor(generated_idx[speak_at:], dtype=torch.long)
         window_seq = int(state["window"]) + 1
         state["window"] = window_seq
         state["turn_open"] = not final_window

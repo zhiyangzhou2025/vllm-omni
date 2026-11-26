@@ -139,6 +139,51 @@ def test_thinker2talker_accepts_owner_compacted_windows_and_prompt() -> None:
     assert result["model_intermediate_buffer"]["hidden_states"]["output"] == rows[:18].tolist()
 
 
+@pytest.mark.parametrize(
+    "signal",
+    [
+        [],
+        [DUPLEX_TOKENS.idle],
+        [DUPLEX_TOKENS.non_idle],
+        [DUPLEX_TOKENS.asr, 900, 901, DUPLEX_TOKENS.asr_eos],
+    ],
+    ids=["none", "activity_idle", "activity_non_idle", "transcript"],
+)
+def test_thinker2talker_hands_the_talker_only_tokens_from_speak_on(signal: list[int]) -> None:
+    prefix_len = 9
+    first = [*signal, DUPLEX_TOKENS.speak, 100, 101, DUPLEX_TOKENS.unit_end]
+    second = [*signal, DUPLEX_TOKENS.speak, 102, DUPLEX_TOKENS.turn_eos, DUPLEX_TOKENS.unit_end]
+    first_rows = prefix_len + AUDIO_WINDOW_PROMPT_TOKENS + len(first) - 1
+    total_rows = first_rows + 1 + AUDIO_WINDOW_PROMPT_TOKENS + len(second) - 1
+    rows = torch.arange(total_rows * 2, dtype=torch.float32).reshape(total_rows, 2)
+    context = SimpleNamespace(
+        bridge_states={"duplex": {"runtime_config": {"system_prefix_token_ids": list(range(prefix_len))}}}
+    )
+
+    def forward(token_ids: list[int], n_rows: int) -> dict:
+        multimodal = {
+            "hidden_states": {"layers": {0: rows[:n_rows].clone(), 24: rows[:n_rows].clone()}},
+            "embed": {"tts_bos": rows[:1], "tts_eos": rows[:1], "tts_pad": rows[:1]},
+        }
+        output = SimpleNamespace(
+            outputs=[SimpleNamespace(cumulative_token_ids=token_ids, multimodal_output=multimodal)],
+            multimodal_output=multimodal,
+            prompt_token_ids=list(range(n_rows)),
+        )
+        return thinker2talker([output], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    speak_at = len(signal)
+    context_rows = prefix_len + AUDIO_WINDOW_PROMPT_TOKENS
+    start = forward(first, first_rows)
+    assert start["ids"]["all"] == list(range(context_rows)) + first[speak_at:-1]
+    assert start["embed"]["prefill"] == rows[:context_rows].tolist() + rows[context_rows + speak_at : first_rows].tolist()
+
+    append = forward(first + second, total_rows)
+    second_start = first_rows + 1 + AUDIO_WINDOW_PROMPT_TOKENS
+    assert append["ids"]["duplex_talker_append"] == second[speak_at:-1]
+    assert append["hidden_states"]["duplex_talker_append"] == rows[second_start + speak_at :].tolist()
+
+
 @pytest.mark.parametrize("remaining_capacity", [1, AUDIO_WINDOW_PROMPT_TOKENS + 31])
 @pytest.mark.parametrize("enforce_eager,async_scheduling", [(True, False), (False, False), (False, True)])
 def test_history_trim_detaches_only_its_own_kv_pages_until_worker_ack(
