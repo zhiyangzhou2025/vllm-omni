@@ -1,0 +1,68 @@
+# 4-GPU fp8 topology: container sees host GPUs 0-3 (4090).
+# Thinker (online fp8, TP4) on GPUs 0-3; Talker (bf16) shares GPU 1, Code2Wav (bf16) shares GPU 2.
+pipeline: qwen3_omni_duplex
+session_mode: duplex
+trust_remote_code: true
+dtype: bfloat16
+enable_prefix_caching: false
+async_chunk: true
+
+duplex_session:
+  max_sessions: 4
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    quantization: fp8
+    async_scheduling: false
+    enforce_eager: false
+    max_model_len: 8192
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.42
+    moe_backend: triton
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+  - stage_id: 1
+    devices: "1"
+    tensor_parallel_size: 1
+    async_scheduling: false
+    enforce_eager: false
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.36
+    moe_backend: triton
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    additional_config:
+      qwen3_omni_duplex_frame_sync: true
+    subtalker_sampling_params:
+      do_sample: false
+    default_sampling_params:
+      temperature: 0.0
+
+  - stage_id: 2
+    devices: "2"
+    tensor_parallel_size: 1
+    async_scheduling: false
+    enforce_eager: false
+    enable_chunked_prefill: false
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.08
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.1
