@@ -16,7 +16,8 @@
     .hint { color: #5b6678; font-size: .88rem; }
     .line { min-height: 1.5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
     .speaker { font-weight: 600; margin: .4rem 0; }
-    #log { height: 16rem; overflow: auto; white-space: pre-wrap; font: 12px/1.45 monospace; }
+    /* One event per line: no wrapping, scroll sideways instead. */
+    #log { height: 16rem; overflow: auto; white-space: pre; font: 12px/1.45 monospace; }
   </style>
 </head>
 <body>
