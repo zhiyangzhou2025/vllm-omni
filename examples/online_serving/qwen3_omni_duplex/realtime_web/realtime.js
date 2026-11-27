@@ -49,10 +49,10 @@
 
   function parseScript(text) {
     const parts = text.split('|').map((part) => part.trim());
-    if (parts.length < 2 || parts.length % 2) throw new Error('返回编排须为 窗口数|内容 成对出现');
+    if (parts.length < 2 || parts.length % 2) throw new Error('script must be <windows>|<content> pairs');
     const steps = [];
     for (let i = 0; i < parts.length; i += 2) {
-      if (!/^\d+$/.test(parts[i])) throw new Error(`第 ${i / 2 + 1} 段的窗口数 "${parts[i]}" 不是非负整数`);
+      if (!/^\d+$/.test(parts[i])) throw new Error(`step ${i / 2 + 1}: windows "${parts[i]}" is not a non-negative integer`);
       steps.push({ delay: Number(parts[i]), content: parts[i + 1] });
     }
     return steps;
@@ -74,9 +74,9 @@
   function realtimeUrl(address, model) {
     const url = new URL(address);
     if (!['ws:', 'wss:'].includes(url.protocol) || !url.host || url.username || url.password) {
-      throw new Error('请提供无凭据的 ws:// 或 wss:// URL');
+      throw new Error('url must be ws:// or wss:// without credentials');
     }
-    if (location.protocol === 'https:' && url.protocol !== 'wss:') throw new Error('HTTPS 页面须使用 wss:');
+    if (location.protocol === 'https:' && url.protocol !== 'wss:') throw new Error('https page requires wss://');
     if (url.pathname === '/') url.pathname = '/v1/realtime';
     url.searchParams.set('duplex', '1');
     url.searchParams.set('model', model);
@@ -124,7 +124,7 @@
     const sentMs = sentSamples * 1000 / INPUT_RATE;
     for (const due of dueAnswers.filter((entry) => entry.at <= sentMs)) {
       dueAnswers = dueAnswers.filter((entry) => entry !== due);
-      log(`  → system2 output ${due.callId.slice(-8)}  ${due.output}`);
+      log(`[s2] send output call=${due.callId.slice(-8)} payload=${due.output}`);
       send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: due.callId, output: due.output } });
     }
   }
@@ -164,30 +164,30 @@
   function handleCall(item) {
     const name = String(item.name || '');
     const callId = String(item.call_id || '');
-    log(`  call ${name}(${item.arguments || ''}) ${callId.slice(-8)}`);
+    log(`[s2] recv ${name} call=${callId.slice(-8)} arguments=${item.arguments || '{}'}`);
     if (!ui.autoAnswer.checked) return;
     if (name === 'system2_cancel') {
-      log(`  → system2 cancel ack ${callId.slice(-8)}`);
+      log(`[s2] send cancel_ack call=${callId.slice(-8)}`);
       send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: callId, output: '' } });
       return;
     }
     if (name !== 'system2_launch') return;
     let arguments_ = {};
-    try { arguments_ = JSON.parse(String(item.arguments || '{}')); } catch { log('  ! system2_launch 参数不是 JSON'); return; }
+    try { arguments_ = JSON.parse(String(item.arguments || '{}')); } catch { log(`[s2] skip launch call=${callId.slice(-8)}: arguments is not JSON`); return; }
     let steps;
-    try { steps = parseScript(ui.answerText.value); } catch (error) { log(`  ! ${error.message}，本次 launch 不回答`); return; }
+    try { steps = parseScript(ui.answerText.value); } catch (error) { log(`[s2] skip launch call=${callId.slice(-8)}: ${error.message}`); return; }
     const index = Math.max(0, Number(arguments_.result_index) || 0);
     const last = index >= steps.length - 1;
     const { delay, content } = steps[Math.min(index, steps.length - 1)];
     const output = JSON.stringify({ content: last ? content + '[SYSTEM2_END]' : content, final: last });
     dueAnswers.push({ at: sentSamples * 1000 / INPUT_RATE + delay * UNIT_MS, callId, output });
-    log(`  system2 ${String(arguments_.generation_id || '').slice(-8)} 第 ${index + 1} 段将在 ${delay} 个窗口后回答${last ? '（final）' : ''}`);
+    log(`[s2] schedule gen=${String(arguments_.generation_id || '').slice(-8)} result_index=${index} call=${callId.slice(-8)} delay=${delay}w final=${last}`);
   }
 
   function handleEvent(event) {
     const raw = { ...event };
     if (raw.type === 'response.output_audio.delta') raw.delta = `<${String(raw.delta || '').length} b64 chars>`;
-    log(JSON.stringify(raw));
+    log(`[recv] ${JSON.stringify(raw)}`);
 
     const type = event.type;
     const id = responseId(event);
@@ -211,10 +211,10 @@
     } else if (type === 'response.output_audio_transcript.done') {
       if (typeof event.transcript === 'string') ui.assistantText.textContent = currentTurnText = event.transcript;
     } else if (type === 'response.output_audio.delta') {
-      if (event.format && event.format !== 'pcm16') { log(`  ! 不支持输出格式 ${event.format}`); return; }
-      if (event.sample_rate_hz && event.sample_rate_hz !== OUTPUT_RATE) { log(`  ! 输出采样率 ${event.sample_rate_hz}`); return; }
+      if (event.format && event.format !== 'pcm16') { log(`[audio] drop delta: unsupported format=${event.format}`); return; }
+      if (event.sample_rate_hz && event.sample_rate_hz !== OUTPUT_RATE) { log(`[audio] drop delta: unexpected sample_rate_hz=${event.sample_rate_hz}`); return; }
       const bytes = fromBase64(event.delta || '');
-      if (bytes.length % 2) { log('  ! 无效 pcm16 音频'); return; }
+      if (bytes.length % 2) { log('[audio] drop delta: pcm16 payload has odd byte length'); return; }
       const view = new DataView(bytes.buffer);
       const pcm = new Int16Array(bytes.length / 2);
       for (let i = 0; i < pcm.length; i++) pcm[i] = view.getInt16(i * 2, true);
@@ -247,7 +247,7 @@
   async function openAudio() {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     playbackContext = new AudioContext({ sampleRate: OUTPUT_RATE });
-    if (playbackContext.sampleRate !== OUTPUT_RATE) throw new Error('浏览器未提供 24 kHz 播放采样率');
+    if (playbackContext.sampleRate !== OUTPUT_RATE) throw new Error('playback AudioContext did not grant 24 kHz');
     await playbackContext.audioWorklet.addModule(`${WORKLET_DIR}/playback_worklet.js`);
     playbackNode = new AudioWorkletNode(playbackContext, 'fullduplex-pcm-playback');
     playbackNode.port.onmessage = ({ data }) => {
@@ -258,7 +258,7 @@
         acknowledge(data.responseId, data.playedMs);
         if (data.responseId) responses.delete(data.responseId);
         if (data.responseId === playbackResponse) playbackResponse = null;
-      } else if (data.type === 'playback-underrun') log(`  ! playback underrun ${data.underrunMs || 0} ms`);
+      } else if (data.type === 'playback-underrun') log(`[audio] playback underrun ms=${data.underrunMs || 0}`);
     };
     playbackNode.connect(playbackContext.destination);
     await playbackContext.resume();
@@ -267,7 +267,7 @@
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: { ideal: INPUT_RATE } },
     });
     captureContext = new AudioContext({ sampleRate: INPUT_RATE });
-    if (captureContext.sampleRate !== INPUT_RATE) throw new Error('浏览器未提供 16 kHz 采集采样率');
+    if (captureContext.sampleRate !== INPUT_RATE) throw new Error('capture AudioContext did not grant 16 kHz');
     await captureContext.audioWorklet.addModule(`${WORKLET_DIR}/pcm_worklet.js`);
     captureNode = new AudioWorkletNode(captureContext, 'fullduplex-pcm-capture', {
       channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
@@ -342,9 +342,9 @@
   async function start() {
     if (ui.start.disabled) return;
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('麦克风需要 localhost 或 HTTPS');
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia unavailable: requires localhost or HTTPS');
       const model = ui.model.value.trim();
-      if (!model) throw new Error('请输入 Model');
+      if (!model) throw new Error('model is empty');
       const address = realtimeUrl(ui.url.value, model);
       ui.start.disabled = true;
       ui.url.disabled = ui.model.disabled = ui.voice.disabled = true;
@@ -377,20 +377,20 @@
             ui.stop.disabled = ui.mute.disabled = false;
           }
         } catch (error) {
-          log(`接收/启动失败: ${error.message || error}`);
+          log(`[session] handle message failed: ${error.message || error}`);
           await stop();
         }
       };
       connected.onerror = () => log(
-        `WebSocket 连接失败：${address}。浏览器里的 127.0.0.1 是浏览器这台机器，` +
-        '不是服务端；远程调试时须把该端口也转发到本机，并确认填的是实际服务端口',
+        `[ws] connect failed url=${address} (host is resolved on the browser machine; ` +
+        'forward the vLLM port to it when debugging remotely and check the port is the actual server port)',
       );
       connected.onclose = () => {
-        if (socket === connected) { log('WebSocket disconnected'); void stop(); }
+        if (socket === connected) { log('[ws] closed'); void stop(); }
       };
-      log(`connecting ${address}`);
+      log(`[ws] connecting url=${address}`);
     } catch (error) {
-      log(`启动失败: ${error.message || error}`);
+      log(`[session] start failed: ${error.message || error}`);
       await stop();
     }
   }
@@ -402,21 +402,21 @@
     let base;
     try {
       const url = new URL(ui.url.value.trim());
-      if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('仅支持 ws:// 或 wss://');
+      if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('url must be ws:// or wss://');
       base = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}/v1/models`;
     } catch (error) {
-      log(`检查失败：地址无效（${error.message}）`);
+      log(`[probe] invalid url: ${error.message}`);
       return;
     }
-    log(`检查 ${base} ...`);
+    log(`[probe] GET ${base}`);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
     try {
       await fetch(base, { mode: 'no-cors', cache: 'no-store', signal: controller.signal });
-      log(`可达：${base}（能连上；接下来看 WebSocket 是否被服务端拒绝）`);
+      log(`[probe] reachable url=${base} (HTTP answered; a WebSocket failure now means the server rejected the upgrade)`);
     } catch (error) {
-      log(`不可达：${base}（${error.name === 'AbortError' ? '超时 5s' : '连接被拒/无法解析'}）——` +
-        '检查端口转发与服务是否在运行');
+      log(`[probe] unreachable url=${base} reason=${error.name === 'AbortError' ? 'timeout(5s)' : 'refused-or-unresolvable'}` +
+        ' (check port forwarding and that the server is running)');
     } finally {
       clearTimeout(timeout);
     }
