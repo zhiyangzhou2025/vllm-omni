@@ -43,12 +43,10 @@
   </section>
   <section>
     <p class="speaker">SYSTEM2</p>
-    <label><input id="autoAnswer" type="checkbox" checked> 自动回答 <code>LAUNCH</code></label>
-    <label>返回编排 <input id="answerText" type="text" value="4|结果内容。" placeholder="4|第一段结果|1|第二段结果|1|第三段结果"></label>
+    <label><input id="autoAnswer" type="checkbox" checked> 下一次 <code>LAUNCH</code> 触发自动返回预案</label>
+    <label><input id="answerText" type="text" value="4|结果内容。" placeholder="4|第一段结果|1|第二段结果|1|第三段结果"></label>
     <p class="hint">
-      格式 <code>窗口数|内容|窗口数|内容|…</code>：第 N 次 <code>LAUNCH</code>（<code>result_index</code>=N-1）
-      在发出后隔指定个时间窗（0.48 s/窗）返回对应段；最后一段为 final 并自动追加 <code>[SYSTEM2_END]</code>。
-      内容里不能含 <code>|</code>。
+      格式为 <code>窗口数|内容|窗口数|内容|…</code>；所有内容中禁止含有 <code>|</code> 符号；最后一段内容自动追加 <code>[SYSTEM2_END]</code> 标识。
     </p>
   </section>
   <section><p class="speaker">事件</p><div id="log" role="log"></div></section>
