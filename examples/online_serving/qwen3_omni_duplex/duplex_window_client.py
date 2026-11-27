@@ -90,8 +90,19 @@ _SUMMARIZED_TYPES = frozenset(
         "input_audio_buffer.committed",
         "conversation.item.input_audio_transcription.delta",
         "conversation.item.input_audio_transcription.completed",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
     }
 )
+
+
+def function_call(event: dict) -> dict | None:
+    """The ``function_call`` item a ``response.output_item.done`` completes, if any."""
+
+    item = event.get("item") or {}
+    if event.get("type") == "response.output_item.done" and item.get("type") == "function_call":
+        return item
+    return None
 
 
 def load_windows(path: Path) -> np.ndarray:
@@ -164,6 +175,12 @@ def describe_slot(events: list[dict]) -> str:
     if any(event.get("type") == "response.output_audio.done" for event in events):
         notes.append("audio-done")
     for event in events:
+        call = function_call(event)
+        if call is not None:
+            notes.append(f"call {call.get('name')}({call.get('arguments')}) {str(call.get('call_id'))[-8:]}")
+        item = event.get("item") or {}
+        if event.get("type") == "conversation.item.done" and item.get("type") == "function_call_output":
+            notes.append(f"output-ack {str(item.get('call_id'))[-8:]}")
         if event.get("type") == "response.done":
             response = event.get("response") or {}
             reason = (response.get("status_details") or {}).get("reason") or response.get("status")
@@ -171,8 +188,7 @@ def describe_slot(events: list[dict]) -> str:
         if event.get("type") == "session.updated":
             session = event.get("session") or {}
             notes.append(
-                f"session.updated(modalities={session.get('modalities')}, "
-                f"instructions={session.get('instructions')!r})"
+                f"session.updated(modalities={session.get('modalities')}, instructions={session.get('instructions')!r})"
             )
         if event.get("type") == "error":
             notes.append(f"ERROR {json.dumps(event, ensure_ascii=False)[:200]}")
@@ -308,6 +324,9 @@ async def run(args: argparse.Namespace) -> int:
     update = json.loads(args.update_json) if args.update_json else None
     if (update is None) != (args.update_at is None):
         raise SystemExit("--update-at and --update-json go together")
+    system2_results = json.loads(args.system2_results) if args.system2_results else []
+    if not isinstance(system2_results, list):
+        raise SystemExit('--system2-results takes a JSON list of {"content": ..., "final": ...}')
     print(
         f"wav={args.wav}\n"
         f"windows={len(windows)} samples_each={INPUT_SAMPLES_PER_UNIT} "
@@ -334,10 +353,28 @@ async def run(args: argparse.Namespace) -> int:
     ) as client:
         print(f"session={client.session_id}", flush=True)
 
+        # System 2 stand-in: answer each launch ``--system2-delay`` windows
+        # later with the result its ``result_index`` picks, and acknowledge
+        # each cancel at once with an empty output.
+        current_window = 0
+        due: list[tuple[int, str, str]] = []
+
+        async def answer(call_id: str, output: str) -> None:
+            item = {"type": "function_call_output", "call_id": call_id, "output": output}
+            await client.send({"type": "conversation.item.create", "item": item})
+
         async def collect() -> None:
             async for event in client.events():
                 arrivals.append(time.monotonic() - started)
                 events.append(event.raw)
+                call = function_call(event.raw)
+                if call is not None and system2_results:
+                    if call.get("name") == "system2_cancel":
+                        await answer(str(call["call_id"]), "")
+                    elif call.get("name") == "system2_launch":
+                        index = int(json.loads(str(call.get("arguments") or "{}")).get("result_index", 0))
+                        result = system2_results[min(index, len(system2_results) - 1)]
+                        due.append((current_window + args.system2_delay, str(call["call_id"]), json.dumps(result)))
                 if args.verbose:
                     raw = dict(event.raw)
                     if raw.get("type") == "response.output_audio.delta":
@@ -346,7 +383,11 @@ async def run(args: argparse.Namespace) -> int:
 
         collector = asyncio.create_task(collect())
         for index, window in enumerate(windows):
+            current_window = index
             mark = len(events)
+            for entry in [entry for entry in due if entry[0] <= index]:
+                due.remove(entry)
+                await answer(entry[1], entry[2])
             await client.append_audio(window.astype("<f4").tobytes())
             if index == args.update_at:
                 # The reply lands in this window's slot as session.updated or error.
@@ -413,8 +454,17 @@ def main() -> int:
         help="output modalities at session open; text alone keeps the Talker and Code2Wav idle",
     )
     parser.add_argument("--instructions", default=None, help="session system prompt; unset uses the server default")
-    parser.add_argument("--update-at", type=int, default=None, help="window index after whose append to send --update-json")
+    parser.add_argument(
+        "--update-at", type=int, default=None, help="window index after whose append to send --update-json"
+    )
     parser.add_argument("--update-json", default=None, help='session.update body, e.g. \'{"modalities": ["text"]}\'')
+    parser.add_argument(
+        "--system2-results",
+        default=None,
+        help='JSON list answering system2_launch by result_index, e.g. \'[{"content": "...", "final": true}]\'; '
+        "unset leaves calls unanswered",
+    )
+    parser.add_argument("--system2-delay", type=int, default=2, help="windows to wait before answering a launch")
     parser.add_argument("--out-dir", default=None, help="write turn<N>.wav per turn and session.wav here")
     parser.add_argument("--jsonl", default=None, help="write every received event to this file")
     parser.add_argument("--verbose", action="store_true", help="print every event as it arrives")
