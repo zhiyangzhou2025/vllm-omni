@@ -27,6 +27,12 @@ Start the server first, then run this against it::
     python examples/online_serving/qwen3_omni_duplex/duplex_window_client.py \
         --wav tests/assets/minicpmo_4_5/soft_interrupt_16k.wav --out-dir /tmp/duplex_out
 
+When the model asks System 2 to look something up, the script answers from
+``SYSTEM2_STEPS``: three staged results spaced 3, 1 and 1 windows from the
+launch asking for them, the last one final. A cancel is acknowledged at once.
+The script only ever answers a call the model made; when those calls happen,
+and whether they happen at all, depends on the audio.
+
 A scripted ``session.update`` exercises the modalities and instructions rules.
 For example, turn speech off from window 6 on::
 
@@ -61,6 +67,16 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (  # noqa: 
 )
 
 OUTPUT_SAMPLE_RATE_HZ = 24_000
+
+# System 2 stand-in. A launch asks for result ``result_index`` of this
+# generation; the answer comes that many windows later, and the last staged
+# result ends the generation. Everything else -- when a launch or a cancel
+# happens -- is left to the model reading the audio.
+SYSTEM2_STEPS = (
+    (3, {"content": "第一段结果", "final": False}),
+    (1, {"content": "第二段结果", "final": False}),
+    (1, {"content": "第三段结果[SYSTEM2_END]", "final": True}),
+)
 
 # Types the per-window line already reports, plus the bookkeeping the session
 # emits around every response. Anything else is surfaced so a new event type
@@ -324,9 +340,6 @@ async def run(args: argparse.Namespace) -> int:
     update = json.loads(args.update_json) if args.update_json else None
     if (update is None) != (args.update_at is None):
         raise SystemExit("--update-at and --update-json go together")
-    system2_results = json.loads(args.system2_results) if args.system2_results else []
-    if not isinstance(system2_results, list):
-        raise SystemExit('--system2-results takes a JSON list of {"content": ..., "final": ...}')
     print(
         f"wav={args.wav}\n"
         f"windows={len(windows)} samples_each={INPUT_SAMPLES_PER_UNIT} "
@@ -353,9 +366,9 @@ async def run(args: argparse.Namespace) -> int:
     ) as client:
         print(f"session={client.session_id}", flush=True)
 
-        # System 2 stand-in: answer each launch ``--system2-delay`` windows
-        # later with the result its ``result_index`` picks, and acknowledge
-        # each cancel at once with an empty output.
+        # Answer each launch with the staged result its ``result_index`` picks,
+        # that many windows later, and acknowledge each cancel at once with an
+        # empty output.
         current_window = 0
         due: list[tuple[int, str, str]] = []
 
@@ -368,13 +381,13 @@ async def run(args: argparse.Namespace) -> int:
                 arrivals.append(time.monotonic() - started)
                 events.append(event.raw)
                 call = function_call(event.raw)
-                if call is not None and system2_results:
+                if call is not None:
                     if call.get("name") == "system2_cancel":
                         await answer(str(call["call_id"]), "")
                     elif call.get("name") == "system2_launch":
                         index = int(json.loads(str(call.get("arguments") or "{}")).get("result_index", 0))
-                        result = system2_results[min(index, len(system2_results) - 1)]
-                        due.append((current_window + args.system2_delay, str(call["call_id"]), json.dumps(result)))
+                        delay, result = SYSTEM2_STEPS[min(index, len(SYSTEM2_STEPS) - 1)]
+                        due.append((current_window + delay, str(call["call_id"]), json.dumps(result)))
                 if args.verbose:
                     raw = dict(event.raw)
                     if raw.get("type") == "response.output_audio.delta":
@@ -458,13 +471,6 @@ def main() -> int:
         "--update-at", type=int, default=None, help="window index after whose append to send --update-json"
     )
     parser.add_argument("--update-json", default=None, help='session.update body, e.g. \'{"modalities": ["text"]}\'')
-    parser.add_argument(
-        "--system2-results",
-        default=None,
-        help='JSON list answering system2_launch by result_index, e.g. \'[{"content": "...", "final": true}]\'; '
-        "unset leaves calls unanswered",
-    )
-    parser.add_argument("--system2-delay", type=int, default=2, help="windows to wait before answering a launch")
     parser.add_argument("--out-dir", default=None, help="write turn<N>.wav per turn and session.wav here")
     parser.add_argument("--jsonl", default=None, help="write every received event to this file")
     parser.add_argument("--verbose", action="store_true", help="print every event as it arrives")
