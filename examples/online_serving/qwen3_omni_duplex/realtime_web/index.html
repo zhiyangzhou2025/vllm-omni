@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3-Omni-Duplex · 直连调试台</title>
+  <style>
+    :root { color-scheme: light; font: 15px/1.5 system-ui, sans-serif; background: #f5f7fb; color: #203048; }
+    body { max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.35rem; }
+    section { background: #fff; border: 1px solid #dbe1eb; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+    label { display: block; margin: .55rem 0; }
+    input[type=url], input[type=text] { box-sizing: border-box; width: 100%; padding: .45rem; font: inherit; }
+    input.num { width: 4rem; padding: .2rem .3rem; font: inherit; }
+    button { padding: .5rem 1rem; margin-right: .5rem; font: inherit; cursor: pointer; }
+    button:disabled { cursor: default; opacity: .5; }
+    .hint { color: #5b6678; font-size: .88rem; }
+    .line { min-height: 1.5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .speaker { font-weight: 600; margin: .4rem 0; }
+    #log { height: 16rem; overflow: auto; white-space: pre-wrap; font: 12px/1.45 monospace; }
+  </style>
+</head>
+<body>
+  <h1>Qwen3-Omni-Duplex · 直连调试台</h1>
+  <p class="hint">
+    浏览器直连 vLLM 的 <code>/v1/realtime?duplex=1</code>，不经过任何转发。
+    麦克风只在 <code>localhost</code> / <code>127.0.0.1</code> 或 HTTPS 下可用。本目录启动静态服务：
+    <code>python -m http.server 8095 --directory examples/online_serving/qwen3_omni_duplex/realtime_web</code>，
+    再打开 <code>http://localhost:8095/</code>。
+  </p>
+  <section>
+    <label>vLLM WebSocket URL <input id="url" type="url" value="ws://127.0.0.1:8093/v1/realtime" autocomplete="url"></label>
+    <label>Model <input id="model" type="text" value="qwen3-omni-duplex"></label>
+    <label><input id="voice" type="checkbox" checked> 语音输出（取消勾选只返回文本，Talker / Code2Wav 不工作）</label>
+    <button id="start" type="button">开始会话</button><button id="stop" type="button" disabled>结束</button><button id="mute" type="button" disabled>静音</button>
+    <p>
+      连接 <span id="status">Offline</span>　播放 <span id="playback">Off</span>
+      SID <span id="sid">—</span>　已发 <span id="inTime">0.0s</span>　已收 <span id="outTime">0.0s</span>
+    </p>
+  </section>
+  <section>
+    <p class="speaker">用户</p><div id="userText" class="line" aria-live="polite"></div>
+    <p class="speaker">助手</p><div id="assistantText" class="line" aria-live="polite"></div>
+  </section>
+  <section>
+    <p class="speaker">System 2</p>
+    <label>
+      <input id="autoAnswer" type="checkbox" checked> 对每次 <code>system2_launch</code> 在
+      <input id="answerDelay" class="num" type="number" min="0" value="3"> 个窗口后回一段 final 结果；
+      <code>system2_cancel</code> 立即回执
+    </label>
+    <label>结果内容 <input id="answerText" type="text" value="第一段结果[SYSTEM2_END]"></label>
+  </section>
+  <section><p class="speaker">事件</p><div id="log" role="log"></div></section>
+  <section><a id="download" hidden>下载本次会话音频</a></section>
+  <script src="realtime.js"></script>
+</body>
+</html>
