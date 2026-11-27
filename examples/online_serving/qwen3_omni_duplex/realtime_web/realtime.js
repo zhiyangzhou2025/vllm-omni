@@ -12,7 +12,7 @@
 
   const $ = (id) => document.getElementById(id);
   const ui = Object.fromEntries(
-    ['url', 'model', 'voice', 'autoAnswer', 'answerDelay', 'answerText', 'probe', 'start', 'stop', 'mute',
+    ['url', 'model', 'voice', 'autoAnswer', 'answerText', 'probe', 'start', 'stop', 'mute',
       'status', 'playback', 'sid', 'inTime', 'outTime', 'userText', 'assistantText', 'log', 'download']
       .map((id) => [id, $(id)]),
   );
@@ -42,10 +42,21 @@
   let recorded = [];
   let currentTurnText = '';
 
-  // System 2 stand-in: one final answer per launch generation, delivered
-  // ``--delay`` windows later; a cancel is acknowledged at once with "".
-  const answeredGenerations = new Set();
+  // System 2 stand-in: the launch with ``result_index`` N is answered with the
+  // N-th step of the "delay|content|delay|content" script, ``delay`` windows
+  // after the launch was seen; a cancel is acknowledged at once with "".
   let dueAnswers = [];
+
+  function parseScript(text) {
+    const parts = text.split('|').map((part) => part.trim());
+    if (parts.length < 2 || parts.length % 2) throw new Error('返回编排须为 窗口数|内容 成对出现');
+    const steps = [];
+    for (let i = 0; i < parts.length; i += 2) {
+      if (!/^\d+$/.test(parts[i])) throw new Error(`第 ${i / 2 + 1} 段的窗口数 "${parts[i]}" 不是非负整数`);
+      steps.push({ delay: Number(parts[i]), content: parts[i + 1] });
+    }
+    return steps;
+  }
 
   function log(text) {
     const line = document.createElement('div');
@@ -163,16 +174,14 @@
     if (name !== 'system2_launch') return;
     let arguments_ = {};
     try { arguments_ = JSON.parse(String(item.arguments || '{}')); } catch { log('  ! system2_launch 参数不是 JSON'); return; }
-    const generation = String(arguments_.generation_id || '');
-    if (answeredGenerations.has(generation)) {
-      log(`  system2 ${generation.slice(-8)} 已答过，忽略后续 launch`);
-      return;
-    }
-    answeredGenerations.add(generation);
-    const delay = Math.max(0, Number(ui.answerDelay.value) || 0);
-    const output = JSON.stringify({ content: ui.answerText.value, final: true });
+    let steps;
+    try { steps = parseScript(ui.answerText.value); } catch (error) { log(`  ! ${error.message}，本次 launch 不回答`); return; }
+    const index = Math.max(0, Number(arguments_.result_index) || 0);
+    const last = index >= steps.length - 1;
+    const { delay, content } = steps[Math.min(index, steps.length - 1)];
+    const output = JSON.stringify({ content: last ? content + '[SYSTEM2_END]' : content, final: last });
     dueAnswers.push({ at: sentSamples * 1000 / INPUT_RATE + delay * UNIT_MS, callId, output });
-    log(`  system2 ${generation.slice(-8)} 将在 ${delay} 个窗口后回答`);
+    log(`  system2 ${String(arguments_.generation_id || '').slice(-8)} 第 ${index + 1} 段将在 ${delay} 个窗口后回答${last ? '（final）' : ''}`);
   }
 
   function handleEvent(event) {
@@ -321,7 +330,7 @@
       ui.download.download = 'duplex_session.wav';
       ui.download.hidden = false;
     }
-    ui.mute.textContent = '静音';
+    ui.mute.textContent = '闭麦';
     ui.start.disabled = false;
     ui.stop.disabled = ui.mute.disabled = true;
     ui.url.disabled = ui.model.disabled = ui.voice.disabled = false;
@@ -346,7 +355,6 @@
       pending = [];
       responses = new Map();
       dueAnswers = [];
-      answeredGenerations.clear();
       playbackResponse = null;
       recorded = [];
       ui.download.hidden = true;
@@ -420,7 +428,7 @@
   ui.mute.addEventListener('click', () => {
     muted = !muted;
     stream?.getAudioTracks().forEach((track) => { track.enabled = !muted; });
-    ui.mute.textContent = muted ? '取消静音' : '静音';
+    ui.mute.textContent = muted ? '开麦' : '闭麦';
   });
   window.addEventListener('beforeunload', () => { void stop(); });
 })();

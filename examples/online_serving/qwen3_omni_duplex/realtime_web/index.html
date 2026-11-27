@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Qwen3-Omni-Duplex · 直连调试台</title>
+  <title>Realtime Duplex · vLLM Online</title>
   <style>
     :root { color-scheme: light; font: 15px/1.5 system-ui, sans-serif; background: #f5f7fb; color: #203048; }
     body { max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
@@ -11,7 +11,6 @@
     section { background: #fff; border: 1px solid #dbe1eb; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
     label { display: block; margin: .55rem 0; }
     input[type=url], input[type=text] { box-sizing: border-box; width: 100%; padding: .45rem; font: inherit; }
-    input.num { width: 4rem; padding: .2rem .3rem; font: inherit; }
     button { padding: .5rem 1rem; margin-right: .5rem; font: inherit; cursor: pointer; }
     button:disabled { cursor: default; opacity: .5; }
     .hint { color: #5b6678; font-size: .88rem; }
@@ -21,23 +20,21 @@
   </style>
 </head>
 <body>
-  <h1>Qwen3-Omni-Duplex · 直连调试台</h1>
+  <h1>Realtime Duplex · vLLM Online</h1>
   <p class="hint">
-    浏览器直连 vLLM 的 <code>/v1/realtime?duplex=1</code>，不经过任何转发。
-    麦克风只在 <code>localhost</code> / <code>127.0.0.1</code> 或 HTTPS 下可用。本目录启动静态服务：
-    <code>python -m http.server 8095 --directory examples/online_serving/qwen3_omni_duplex/realtime_web</code>，
-    再打开 <code>http://localhost:8095/</code>。
-    远程调试时，页面端口（如 8095）和 vLLM 端口（如 8093 / 8094）<strong>两个都要</strong>转发到本机，
-    因为在浏览器里 <code>127.0.0.1</code> 指的是你自己的电脑。
+    浏览器直连 vLLM API 服务。
+    麦克风只在 <code>localhost</code> 或 HTTPS 下可用。
   </p>
   <section>
-    <label>vLLM WebSocket URL <input id="url" type="url" value="ws://127.0.0.1:8093/v1/realtime" autocomplete="url"></label>
-    <label>Model <input id="model" type="text" value="qwen3-omni-duplex"></label>
-    <label><input id="voice" type="checkbox" checked> 语音输出（取消勾选只返回文本，Talker / Code2Wav 不工作）</label>
-    <button id="probe" type="button">检查连通性</button><button id="start" type="button">开始会话</button><button id="stop" type="button" disabled>结束</button><button id="mute" type="button" disabled>静音</button>
+    <label>链接 <input id="url" type="url" value="ws://127.0.0.1:8093/v1/realtime" autocomplete="url"></label>
+    <label>模型 <input id="model" type="text" value="qwen3-omni-duplex"></label>
+    <label><input id="voice" type="checkbox" checked> 语音输出（取消勾选只返回文本）</label>
+    <button id="probe" type="button">检查</button>
+    <button id="start" type="button">开始</button>
+    <button id="stop" type="button" disabled>结束</button>
+    <button id="mute" type="button" disabled>闭麦</button>
     <p>
-      连接 <span id="status">Offline</span>　播放 <span id="playback">Off</span>
-      SID <span id="sid">—</span>　已发 <span id="inTime">0.0s</span>　已收 <span id="outTime">0.0s</span>
+      连接 <span id="status">Offline</span> | 播放 <span id="playback">Off</span> | SID <span id="sid">—</span> | 已发 <span id="inTime">0.0s</span> | 已收 <span id="outTime">0.0s</span>
     </p>
   </section>
   <section>
@@ -45,13 +42,14 @@
     <p class="speaker">助手</p><div id="assistantText" class="line" aria-live="polite"></div>
   </section>
   <section>
-    <p class="speaker">System 2</p>
-    <label>
-      <input id="autoAnswer" type="checkbox" checked> 对每次 <code>system2_launch</code> 在
-      <input id="answerDelay" class="num" type="number" min="0" value="3"> 个窗口后回一段 final 结果；
-      <code>system2_cancel</code> 立即回执
-    </label>
-    <label>结果内容 <input id="answerText" type="text" value="第一段结果[SYSTEM2_END]"></label>
+    <p class="speaker">SYSTEM2</p>
+    <label><input id="autoAnswer" type="checkbox" checked> 自动回答 <code>LAUNCH</code></label>
+    <label>返回编排 <input id="answerText" type="text" value="4|结果内容。" placeholder="4|第一段结果|1|第二段结果|1|第三段结果"></label>
+    <p class="hint">
+      格式 <code>窗口数|内容|窗口数|内容|…</code>：第 N 次 <code>LAUNCH</code>（<code>result_index</code>=N-1）
+      在发出后隔指定个时间窗（0.48 s/窗）返回对应段；最后一段为 final 并自动追加 <code>[SYSTEM2_END]</code>。
+      内容里不能含 <code>|</code>。
+    </p>
   </section>
   <section><p class="speaker">事件</p><div id="log" role="log"></div></section>
   <section><a id="download" hidden>下载本次会话音频</a></section>
