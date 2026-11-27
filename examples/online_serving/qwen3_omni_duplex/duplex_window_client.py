@@ -28,10 +28,11 @@ Start the server first, then run this against it::
         --wav tests/assets/minicpmo_4_5/soft_interrupt_16k.wav --out-dir /tmp/duplex_out
 
 When the model asks System 2 to look something up, the script answers from
-``SYSTEM2_STEPS``: three staged results spaced 3, 1 and 1 windows from the
-launch asking for them, the last one final. A cancel is acknowledged at once.
-The script only ever answers a call the model made; when those calls happen,
-and whether they happen at all, depends on the audio.
+one of three ``SYSTEM2_PLANS`` drawn at random for each generation: a single
+result, three staged results spaced 3, 1 and 1 windows from the launch asking
+for them, or a failure. A cancel is acknowledged at once. The script only ever
+answers a call the model made; when those calls happen, and whether they happen
+at all, depends on the audio.
 
 A scripted ``session.update`` exercises the modalities and instructions rules.
 For example, turn speech off from window 6 on::
@@ -44,6 +45,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sys
 import time
 import wave
@@ -68,15 +70,26 @@ from vllm_omni.model_executor.models.qwen3_omni_duplex.stage0 import (  # noqa: 
 
 OUTPUT_SAMPLE_RATE_HZ = 24_000
 
-# System 2 stand-in. A launch asks for result ``result_index`` of this
-# generation; the answer comes that many windows later, and the last staged
-# result ends the generation. Everything else -- when a launch or a cancel
-# happens -- is left to the model reading the audio.
-SYSTEM2_STEPS = (
-    (3, {"content": "第一段结果", "final": False}),
-    (1, {"content": "第二段结果", "final": False}),
-    (1, {"content": "第三段结果[SYSTEM2_END]", "final": True}),
-)
+# System 2 stand-in. A launch asks for result ``result_index`` of a generation;
+# the answer comes that many windows after the launch asking for it, and the
+# last staged result ends the generation. Each new generation is answered by
+# one of these scripts, picked at random with equal chance:
+#
+# * ``single`` streams the whole result at once;
+# * ``multi`` streams it in three parts;
+# * ``failure`` reports that the lookup failed.
+#
+# Everything else -- when a launch or a cancel happens -- is left to the model
+# reading the audio.
+SYSTEM2_PLANS = {
+    "single": ((3, {"content": "第一段结果[SYSTEM2_END]", "final": True}),),
+    "multi": (
+        (3, {"content": "第一段结果", "final": False}),
+        (1, {"content": "第二段结果", "final": False}),
+        (1, {"content": "第三段结果[SYSTEM2_END]", "final": True}),
+    ),
+    "failure": ((3, {"content": "查询失败[SYSTEM2_END]", "final": True}),),
+}
 
 # Types the per-window line already reports, plus the bookkeeping the session
 # emits around every response. Anything else is surfaced so a new event type
@@ -368,8 +381,10 @@ async def run(args: argparse.Namespace) -> int:
 
         # Answer each launch with the staged result its ``result_index`` picks,
         # that many windows later, and acknowledge each cancel at once with an
-        # empty output.
+        # empty output. A generation's first launch draws the script answering
+        # all of its launches.
         current_window = 0
+        scripts: dict[str, tuple] = {}
         due: list[tuple[int, str, str]] = []
 
         async def answer(call_id: str, output: str) -> None:
@@ -385,8 +400,17 @@ async def run(args: argparse.Namespace) -> int:
                     if call.get("name") == "system2_cancel":
                         await answer(str(call["call_id"]), "")
                     elif call.get("name") == "system2_launch":
-                        index = int(json.loads(str(call.get("arguments") or "{}")).get("result_index", 0))
-                        delay, result = SYSTEM2_STEPS[min(index, len(SYSTEM2_STEPS) - 1)]
+                        arguments = json.loads(str(call.get("arguments") or "{}"))
+                        generation = str(arguments.get("generation_id") or "")
+                        if generation not in scripts:
+                            draw = random.choice(sorted(SYSTEM2_PLANS))
+                            scripts[generation] = SYSTEM2_PLANS[draw]
+                            print(
+                                f"    {time.monotonic() - started:7.2f}s system2 {draw} {generation[-8:]}", flush=True
+                            )
+                        steps = scripts[generation]
+                        index = int(arguments.get("result_index", 0))
+                        delay, result = steps[min(index, len(steps) - 1)]
                         due.append((current_window + delay, str(call["call_id"]), json.dumps(result)))
                 if args.verbose:
                     raw = dict(event.raw)
