@@ -229,13 +229,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object] | None:
         """Render a launch result as the ToolBlock the next window carries.
 
-        A cancel acknowledgement only settles its call. A launch result must
-        answer the call its generation still awaits, and its ``output`` is
-        ``{"content": str, "final": bool}``; ``content`` enters verbatim.
+        A cancel acknowledgement only settles its call, and so does any output
+        for a launch whose generation ended while its result was owed. Any
+        other launch result must answer the call its generation still awaits,
+        and its ``output`` is ``{"content": str, "final": bool}``; ``content``
+        enters verbatim.
         """
         del config, history_len
         call_id, name = item.get("call_id"), item.get("name")
-        if name == SYSTEM2_CANCEL:
+        if name == SYSTEM2_CANCEL or call_id in self.data_plane.abandoned_calls:
             return None
         if name != SYSTEM2_LAUNCH or not isinstance(call_id, str):
             raise DuplexRuntimeConfigError(

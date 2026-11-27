@@ -228,9 +228,38 @@ def test_cancel_publishes_its_own_call_and_its_acknowledgement_changes_nothing()
     assert cancel["name"] == "system2_cancel" and cancel["call_id"] != launch["call_id"]
     assert json.loads(cancel["arguments"]) == {"generation_id": launch["call_id"]}
     assert _answer(plugin, cancel, runtime, output="") is runtime
-    # The cancelled generation's result has no generation left to answer.
+
+
+def test_a_result_owed_by_a_cancelled_generation_settles_and_is_dropped() -> None:
+    plugin = _plugin()
+    history: list[int] = []
+    _, runtime = _append(plugin, {"system_prefix_token_ids": _PREFIX}, 1)
+    (launch,) = _calls(_close(plugin, history, _LAUNCH))
+    _calls(_close(plugin, history, _CANCEL))
+
+    assert _answer(plugin, launch, runtime) is runtime
+    assert launch["call_id"] not in plugin.data_plane.abandoned_calls
+    assert launch["call_id"] not in plugin.data_plane.call_requests
+    prompt, _ = _append(plugin, runtime, 2)
+    assert prompt["prompt_token_ids"] == [DUPLEX_TOKENS.unit_end] + [DUPLEX_TOKENS.unit_start] * 9
+    # Settled: a second output is no longer the abandoned call's.
     with pytest.raises(DuplexRuntimeConfigError):
         _answer(plugin, launch, runtime)
+
+
+def test_a_cancel_abandons_the_relaunched_call_not_the_answered_one() -> None:
+    plugin = _plugin()
+    history: list[int] = []
+    runtime = {"system_prefix_token_ids": _PREFIX}
+    (first,) = _calls(_close(plugin, history, _LAUNCH))
+    runtime = _answer(plugin, first, runtime, final=False)
+    _, runtime = _append(plugin, runtime, 2)
+    (second,) = _calls(_close(plugin, history, _LISTEN))
+
+    _calls(_close(plugin, history, _CANCEL))
+
+    assert plugin.data_plane.abandoned_calls == {second["call_id"]}
+    assert _answer(plugin, second, runtime) is runtime
 
 
 def test_cancel_then_launch_starts_a_new_generation() -> None:
@@ -247,6 +276,11 @@ def test_cancel_then_launch_starts_a_new_generation() -> None:
     assert (cancel["name"], new["name"]) == ("system2_cancel", "system2_launch")
     assert json.loads(cancel["arguments"]) == {"generation_id": old["call_id"]}
     assert json.loads(new["arguments"]) == {"generation_id": new["call_id"], "result_index": 0}
+    assert plugin.data_plane.abandoned_calls == {old["call_id"]}
+    # The old result settles quietly; the new generation still takes its own.
+    runtime = {"system_prefix_token_ids": _PREFIX}
+    assert _answer(plugin, old, runtime) is runtime
+    assert _answer(plugin, new, runtime)[SYSTEM2_PENDING_KEY]["call_id"] == new["call_id"]
 
 
 @pytest.mark.parametrize(
@@ -295,10 +329,12 @@ def test_closing_the_session_forgets_its_calls() -> None:
     for call_id, request_id in (("call_a", mine), ("call_b", other)):
         plugin.data_plane.call_requests[call_id] = request_id
         plugin.data_plane.system2[request_id] = System2Generation(generation_id=call_id, awaiting=call_id)
+    plugin.data_plane.abandoned_calls.update({"call_a", "call_b"})
 
     plugin.data_plane.close_session("sess")
 
     assert plugin.data_plane.call_requests == {"call_b": other}
+    assert plugin.data_plane.abandoned_calls == {"call_b"}
     assert list(plugin.data_plane.system2) == [other]
 
 

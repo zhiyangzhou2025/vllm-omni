@@ -105,6 +105,9 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         self.system2: dict[str, System2Generation] = {}
         # Every published call names the request it belongs to until it settles.
         self.call_requests: dict[str, str] = {}
+        # Launch calls still owed a result whose generation has ended. Their
+        # result settles the call and is dropped.
+        self.abandoned_calls: set[str] = set()
         self._encode_audio = encode_audio
         # Set by the plugin once the deployment's stages are known. None means
         # this deployment has no audio stage, so Stage 0 behaves as before.
@@ -158,6 +161,12 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
             for call_id, request_id in self.call_requests.items()
             if not duplex_resource_request_belongs_to_session(request_id, session_id)
         }
+        self.abandoned_calls &= self.call_requests.keys()
+
+    def _abandon(self, generation: System2Generation) -> None:
+        if generation.awaiting is not None:
+            self.abandoned_calls.add(generation.awaiting)
+        generation.generation_id = generation.awaiting = None
 
     def _system2_calls(self, request_id: str, actions: Sequence[int]) -> list[dict[str, str]]:
         """The calls one closed window publishes, in the order the model acted."""
@@ -166,9 +175,10 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
         for token_id in actions:
             if token_id == DUPLEX_TOKENS.cancel and generation.generation_id is not None:
                 calls.append(self._publish(request_id, SYSTEM2_CANCEL, {"generation_id": generation.generation_id}))
-                generation.generation_id = generation.awaiting = None
+                self._abandon(generation)
                 generation.relaunch = False
             elif token_id == DUPLEX_TOKENS.launch:
+                self._abandon(generation)
                 call_id = _new_call_id()
                 generation.generation_id = generation.awaiting = call_id
                 generation.result_index = 0
@@ -201,6 +211,7 @@ class Qwen3OmniDuplexDataPlane(DuplexDataPlane):
 
     def settled_call(self, call_id: str) -> None:
         """The client answered, or can no longer answer, this call."""
+        self.abandoned_calls.discard(call_id)
         request_id = self.call_requests.pop(call_id, None)
         generation = self.system2.get(request_id) if request_id is not None else None
         if generation is not None and generation.awaiting == call_id:
