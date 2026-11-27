@@ -12,7 +12,7 @@
 
   const $ = (id) => document.getElementById(id);
   const ui = Object.fromEntries(
-    ['url', 'model', 'voice', 'autoAnswer', 'answerDelay', 'answerText', 'start', 'stop', 'mute',
+    ['url', 'model', 'voice', 'autoAnswer', 'answerDelay', 'answerText', 'probe', 'start', 'stop', 'mute',
       'status', 'playback', 'sid', 'inTime', 'outTime', 'userText', 'assistantText', 'log', 'download']
       .map((id) => [id, $(id)]),
   );
@@ -373,7 +373,10 @@
           await stop();
         }
       };
-      connected.onerror = () => log('WebSocket 连接失败；检查地址与服务是否在运行');
+      connected.onerror = () => log(
+        `WebSocket 连接失败：${address}。浏览器里的 127.0.0.1 是浏览器这台机器，` +
+        '不是服务端；远程调试时须把该端口也转发到本机，并确认填的是实际服务端口',
+      );
       connected.onclose = () => {
         if (socket === connected) { log('WebSocket disconnected'); void stop(); }
       };
@@ -384,6 +387,34 @@
     }
   }
 
+  // Reachability probe: a no-cors GET needs no CORS headers, so success means
+  // the address answered at all (port forwarded and service listening) and a
+  // failure means the browser never reached it.
+  async function probe() {
+    let base;
+    try {
+      const url = new URL(ui.url.value.trim());
+      if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('仅支持 ws:// 或 wss://');
+      base = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}/v1/models`;
+    } catch (error) {
+      log(`检查失败：地址无效（${error.message}）`);
+      return;
+    }
+    log(`检查 ${base} ...`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch(base, { mode: 'no-cors', cache: 'no-store', signal: controller.signal });
+      log(`可达：${base}（能连上；接下来看 WebSocket 是否被服务端拒绝）`);
+    } catch (error) {
+      log(`不可达：${base}（${error.name === 'AbortError' ? '超时 5s' : '连接被拒/无法解析'}）——` +
+        '检查端口转发与服务是否在运行');
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  ui.probe.addEventListener('click', () => { void probe(); });
   ui.start.addEventListener('click', start);
   ui.stop.addEventListener('click', () => { void stop(); });
   ui.mute.addEventListener('click', () => {

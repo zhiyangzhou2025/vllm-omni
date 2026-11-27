@@ -27,12 +27,14 @@
     麦克风只在 <code>localhost</code> / <code>127.0.0.1</code> 或 HTTPS 下可用。本目录启动静态服务：
     <code>python -m http.server 8095 --directory examples/online_serving/qwen3_omni_duplex/realtime_web</code>，
     再打开 <code>http://localhost:8095/</code>。
+    远程调试时，页面端口（如 8095）和 vLLM 端口（如 8093 / 8094）<strong>两个都要</strong>转发到本机，
+    因为在浏览器里 <code>127.0.0.1</code> 指的是你自己的电脑。
   </p>
   <section>
     <label>vLLM WebSocket URL <input id="url" type="url" value="ws://127.0.0.1:8093/v1/realtime" autocomplete="url"></label>
     <label>Model <input id="model" type="text" value="qwen3-omni-duplex"></label>
     <label><input id="voice" type="checkbox" checked> 语音输出（取消勾选只返回文本，Talker / Code2Wav 不工作）</label>
-    <button id="start" type="button">开始会话</button><button id="stop" type="button" disabled>结束</button><button id="mute" type="button" disabled>静音</button>
+    <button id="probe" type="button">检查连通性</button><button id="start" type="button">开始会话</button><button id="stop" type="button" disabled>结束</button><button id="mute" type="button" disabled>静音</button>
     <p>
       连接 <span id="status">Offline</span>　播放 <span id="playback">Off</span>
       SID <span id="sid">—</span>　已发 <span id="inTime">0.0s</span>　已收 <span id="outTime">0.0s</span>
