@@ -39,7 +39,15 @@
   let responses = new Map();
   let playbackResponse = null;
   let logLines = 0;
-  let recorded = [];
+  // Session recording, 24 kHz stereo, the same layout the reference backend
+  // dumps: microphone on the left, assistant on the right. The microphone
+  // frames are contiguous from the first captured sample, which makes that
+  // sample the session clock's zero; each assistant delta is stamped with the
+  // capture position reached when it arrived, so gaps stay gaps.
+  let capturedUser = [];
+  let capturedSamples = 0;
+  let assistantClips = [];
+  let assistantEnd = 0;
   let currentTurnText = '';
 
   // System 2 stand-in: the launch with ``result_index`` N is answered with the
@@ -222,7 +230,11 @@
       if (response) response.audioSamples += pcm.length;
       receivedSamples += pcm.length;
       // Copy: postMessage below transfers the buffer away from this view.
-      recorded.push(new Int16Array(pcm));
+      // Never rewind the cursor: a burst of deltas arriving between two flushes
+      // shares one timestamp, and they must still play in order.
+      const start = Math.max(assistantEnd, Math.round(capturedSamples * OUTPUT_RATE / INPUT_RATE));
+      assistantClips.push({ start, pcm: new Int16Array(pcm) });
+      assistantEnd = start + pcm.length;
       playbackResponse = id;
       playbackNode?.port.postMessage({ type: 'audio', pcm, responseId: id, initialBufferMs: INITIAL_BUFFER_MS }, [pcm.buffer]);
       tick();
@@ -272,7 +284,12 @@
     captureNode = new AudioWorkletNode(captureContext, 'fullduplex-pcm-capture', {
       channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
     });
-    captureNode.port.onmessage = ({ data }) => pending.push(new Int16Array(data));
+    captureNode.port.onmessage = ({ data }) => {
+      const pcm = new Int16Array(data);
+      pending.push(pcm);
+      capturedUser.push(pcm);
+      capturedSamples += pcm.length;
+    };
     captureContext.createMediaStreamSource(stream).connect(captureNode);
     const silent = captureContext.createGain();
     silent.gain.value = 0;
@@ -282,22 +299,38 @@
   }
 
   function wavBlob() {
-    const samples = recorded.reduce((total, part) => total + part.length, 0);
-    const buffer = new ArrayBuffer(44 + samples * 2);
+    const userOutputSamples = Math.round(capturedSamples * OUTPUT_RATE / INPUT_RATE);
+    const frames = Math.max(userOutputSamples, assistantEnd);
+    if (!frames) return null;
+    const buffer = new ArrayBuffer(44 + frames * 4);
     const view = new DataView(buffer);
     const ascii = (offset, text) => { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); };
-    ascii(0, 'RIFF'); view.setUint32(4, 36 + samples * 2, true); ascii(8, 'WAVEfmt ');
-    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-    view.setUint32(24, OUTPUT_RATE, true); view.setUint32(28, OUTPUT_RATE * 2, true);
-    view.setUint16(32, 2, true); view.setUint16(34, 16, true); ascii(36, 'data');
-    view.setUint32(40, samples * 2, true);
-    const body = new Int16Array(buffer, 44, samples); // 44 is even, so the view is aligned
+    ascii(0, 'RIFF'); view.setUint32(4, 36 + frames * 4, true); ascii(8, 'WAVEfmt ');
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 2, true);
+    view.setUint32(24, OUTPUT_RATE, true); view.setUint32(28, OUTPUT_RATE * 4, true);
+    view.setUint16(32, 4, true); view.setUint16(34, 16, true); ascii(36, 'data');
+    view.setUint32(40, frames * 4, true);
+    const body = new Int16Array(buffer, 44, frames * 2); // 44 is even, so the view is aligned
+
+    // Left: microphone, linearly resampled 16 kHz -> 24 kHz so both channels
+    // share one session clock.
+    const user = new Int16Array(capturedSamples);
     let offset = 0;
-    for (const part of recorded) {
-      body.set(part, offset);
-      offset += part.length;
+    for (const part of capturedUser) { user.set(part, offset); offset += part.length; }
+    const step = INPUT_RATE / OUTPUT_RATE;
+    for (let frame = 0; frame < userOutputSamples; frame++) {
+      const position = frame * step;
+      const index = Math.floor(position);
+      const next = Math.min(index + 1, user.length - 1);
+      const a = user[index];
+      body[frame * 2] = Math.round(a + (user[next] - a) * (position - index));
     }
-    return samples ? new Blob([buffer], { type: 'audio/wav' }) : null;
+
+    // Right: assistant deltas at the session position they arrived at.
+    for (const { start, pcm } of assistantClips) {
+      for (let i = 0; i < pcm.length && start + i < frames; i++) body[(start + i) * 2 + 1] = pcm[i];
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
   }
 
   async function stop() {
@@ -356,7 +389,10 @@
       responses = new Map();
       dueAnswers = [];
       playbackResponse = null;
-      recorded = [];
+      capturedUser = [];
+      capturedSamples = 0;
+      assistantClips = [];
+      assistantEnd = 0;
       ui.download.hidden = true;
       tick();
       const connected = new WebSocket(address);
