@@ -667,6 +667,17 @@ class DuplexModelPlugin(ABC):
         del runtime_config
         return False
 
+    def function_output_continues_response(self) -> bool:
+        """Whether accepting a ``function_call_output`` should resume the model.
+
+        A turn-taking model ends its turn to wait for the result, so the session
+        has to continue the response once the result arrives. A model that
+        keeps producing units of its own -- the result enters its next append
+        as a prompt -- needs no continuation, and one would submit a unit the
+        client never sent. Those plugins answer ``False``.
+        """
+        return True
+
     def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
         """Runtime entries this model's prompt preparation reads. Default: none."""
         del runtime_config

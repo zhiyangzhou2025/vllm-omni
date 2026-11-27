@@ -275,6 +275,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             },
         }
 
+    def function_output_continues_response(self) -> bool:
+        """A result waits for the next client window, which carries it.
+
+        Stage 0 reads one audio window per append, and the result enters the
+        one the client sends next. Continuing the response here would submit a
+        window the client never sent and shift the model's timeline by a unit.
+        """
+        return False
+
     def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
         self.data_plane.settled_call(settlement.origin.call_id)
 

@@ -647,7 +647,12 @@ class SessionControl:
         # Tool-result admission does not finish an in-flight committed turn.
         # Its real terminal output owns response closure; the non-resumable
         # branch of maybe_continue_response is only for listen/final decisions.
-        if session.capabilities.supports_core_resumable_request:
+        # A model that carries the result into its own next unit answers
+        # ``False``: a continuation would submit a unit the client never sent.
+        if (
+            session.capabilities.supports_core_resumable_request
+            and self._ctx.plugin.function_output_continues_response()
+        ):
             self._ctx.services.spawn(
                 self._model.maybe_continue_response(
                     expected_epoch=epoch,
